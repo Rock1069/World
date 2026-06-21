@@ -1,0 +1,3576 @@
+// world-engine-ui.js — 完整 UI 面板
+window.WORLD_ENGINE_UI = (function() {
+  const core = window.WORLD_ENGINE_CORE;
+  const evolution = window.WORLD_ENGINE_EVOLUTION;
+
+  let panelElement = null;
+  let panelBodyElement = null;
+  let panelVisible = false;
+  let isEvolving = false;
+  let editingEvent = null;
+  let editingFaction = null;
+  let editingWind = null;
+  let editingTrend = null;
+  let editingEnemy = null;
+  let editingNpc = null;
+  let editingInfluence = null;
+  let editingRI = null;
+  // 秘密编辑器统一态：{ scope, list:'action'|'asset', index, view:'action'|'asset' }
+  //   list  = 条目当前所在的桶；index = 在该桶里的下标
+  //   view  = 当前显示的表单类型（切下拉只改 view，不动数据；转换延到保存）
+  let editingSecret = null;
+  let listPagerCounter = 0;
+  const listPageState = {};
+  const sectionCollapsed = { 'checkpoint-section': true, 'set-filter': true };
+  const expandedWorldbookGroups = new Set();
+  // 世界书缓存（模块级，跨 refresh() 存活）
+  let _wbCachedEntries = null;
+  let _wbCachedSelectedIds = null;
+  let _wbCachedChatId = null;
+  let _wbScrollTop = 0;
+
+  function h(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, m => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[m] || m));
+  }
+
+  /** 渲染用户可见文本：将 {{user}} 替换为当前角色名，并转义 HTML */
+  function u(text) {
+    return h(core.renderUserName(text));
+  }
+
+  function showToast(msg, isError, duration) {
+    const id = 'we-toast';
+    let el = document.getElementById(id);
+    if (el) el.remove();
+    el = document.createElement('div');
+    el.id = id;
+    el.className = 'we-toast' + (isError ? ' error' : '');
+    el.textContent = msg;
+    document.body.appendChild(el);
+    if (duration !== 0) setTimeout(() => el.remove(), duration || 3000);
+  }
+
+  // 各分页小标题的随附古文（去 cp- 前缀后查表；设置页等不在表中则无）
+  const SECTION_MOTTOS = {
+    trends: '天下之势，以渐而成',
+    regional: '一方有警，四面皆惊',
+    ledger: '毫厘皆有来历',
+    events: '牵一发而全身动',
+    winds: '风起于青萍之末',
+    influence: '牵枝而动叶',
+    reputation: '人之有誉，如影随形',
+    factions: '大树之下，草不沾霜',
+    enemies: '仇者快，亲者痛',
+    economy: '食者民之本，货者民用之资',
+    blackbox: '墙有耳，伏寇在侧',
+    npcs: '千人千面，各行其志'
+  };
+
+  function sectionHeader(title, sectionId) {
+    const collapsed = sectionCollapsed[sectionId] || false;
+    const motto = SECTION_MOTTOS[sectionId.replace(/^cp-/, '')];
+    const mottoHtml = motto ? `<span class="we-section-motto">— ${motto}</span>` : '';
+    return `<span class="we-section-toggle" data-section="${sectionId}">
+      <span class="we-section-arrow" id="we-section-arrow-${sectionId}">${collapsed ? '▶' : '▼'}</span>${title}${mottoHtml}
+    </span>`;
+  }
+
+  function sectionBody(sectionId, content) {
+    const collapsed = sectionCollapsed[sectionId] || false;
+    return `<div class="we-section-body" id="we-section-body-${sectionId}" style="${collapsed ? 'display:none' : ''}">${content}</div>`;
+  }
+
+  function buildPanel() {
+    if (document.getElementById('we-panel')) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'we-panel';
+    panel.innerHTML = `
+      <div class="we-panel-header">
+        <div class="we-header-info">
+          <div class="we-header-top">
+            <span class="we-panel-title">世界引擎</span>
+            <span class="we-header-round" id="we-header-round"></span>
+          </div>
+          <div class="we-header-mood" id="we-header-mood">
+            <span class="we-header-dot"></span>
+            <span class="we-header-mood-text"></span>
+          </div>
+        </div>
+        <div class="we-panel-corner-actions">
+          <button class="we-panel-close">✕</button>
+          <button class="we-panel-settings" id="we-btn-settings-open" title="设置"><i class="fa-solid fa-gear"></i></button>
+        </div>
+      </div>
+      <div class="we-panel-body" id="we-panel-body">
+        <div class="we-loading">加载中...</div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    panelElement = panel;
+    panelBodyElement = panel.querySelector('#we-panel-body');
+
+    panel.querySelector('.we-panel-close').onclick = () => hidePanel();
+    initDrag(panel, panel.querySelector('.we-panel-header'));
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape' && panelVisible) hidePanel();
+    });
+  }
+
+  // 当前视图：'home' | 'situation' | 'events' | 'relations' | 'resources' | 'settings'
+  let _currentView = 'home';
+  // 显示模式：'mask'=遮蔽（主页+分页）｜'expand'=展开（所有 section 平铺）
+  function isExpandMode() {
+    const s = window.WORLD_ENGINE_API
+      ? window.WORLD_ENGINE_API.getSettings()
+      : JSON.parse(window.WORLD_ENGINE_STORE.getItem('world_engine_settings') || '{}');
+    return s.displayMode === 'expand';
+  }
+  // 主页导航：单击选中的行（再次单击才进入）
+  let _selectedNavView = null;
+  // 推演进行中标志 + 本次推演的显示基底：
+  //   'checkpoint' = 重新推演（喂存档点 B，面板显示 B）
+  //   'state'      = 向前推演（喂当前状态 A，面板显示 A）
+  // 推演期间新结果还没写回，靠这俩决定面板显示哪份，等写回再翻新。
+  let _evolving = false;
+  let _evolvingScope = 'state';
+  // 最近一次实际注入正文的状态桶；普通刷新必须跟随它，不能重新按瞬时楼层猜测。
+  let _injectedScope = null;
+
+  /**
+   * 计算此刻实际注入正文的那一份世界状态（与 world-engine.js
+   * applyInjectionForCurrentRound 用同一条楼层判断）：
+   *   对话层数 < 当前状态层数 且有存档点 → 注入/显示存档点（重 roll 回退）
+   *   否则 → 注入/显示当前状态
+   * 返回的 scope 同时决定编辑写回哪个存储桶。
+   */
+  function getActiveInjected(state, checkpoint) {
+    // 推演进行中：新结果还没写回，按本次推演的基底显示——
+    //   重新推演（_evolvingScope='checkpoint'）→ 显示存档点 B；
+    //   向前推演（_evolvingScope='state'）   → 显示当前状态 A。
+    if (_evolving) {
+      if (_evolvingScope === 'checkpoint' && checkpoint) {
+        return { state: checkpoint, scope: 'checkpoint', layer: getCheckpointLayer(checkpoint) };
+      }
+      return { state: state, scope: 'state', layer: Number.isFinite(Number(state.chatLayer)) ? Number(state.chatLayer) : getChatLayer() };
+    }
+    if (_injectedScope === 'checkpoint' && checkpoint) {
+      return { state: checkpoint, scope: 'checkpoint', layer: getCheckpointLayer(checkpoint) };
+    }
+    if (_injectedScope === 'state') {
+      return { state: state, scope: 'state', layer: Number.isFinite(Number(state.chatLayer)) ? Number(state.chatLayer) : getChatLayer() };
+    }
+    const chatLayer = core.getChatLayer();
+    const stateLayer = Number.isFinite(Number(state.chatLayer)) ? Number(state.chatLayer) : chatLayer;
+    if (chatLayer < stateLayer && checkpoint) {
+      return { state: checkpoint, scope: 'checkpoint', layer: getCheckpointLayer(checkpoint) };
+    }
+    return { state: state, scope: 'state', layer: Number.isFinite(Number(state.chatLayer)) ? Number(state.chatLayer) : getChatLayer() };
+  }
+
+  // 按当前显示/编辑的存储桶读写：scope==='checkpoint' 读写存档点，其余读写主状态。
+  // 面板可能正在显示存档点（重 roll 回退）或设置页的存档点小节，此时所有编辑必须
+  // 写回存档点而非主状态，否则“数据变了、界面不动 / 点了没反应”（与风声同源的毛病）。
+  function loadScopedState(scope) {
+    return scope === 'checkpoint' ? core.restoreCheckpoint() : core.loadState();
+  }
+  function saveScopedState(scope, scopedState) {
+    if (scope === 'checkpoint') core.saveCheckpoint(scopedState);
+    else core.saveState(scopedState);
+  }
+
+  function refresh(auto) {
+    if (!panelElement || !panelVisible) return;
+    // 设置页是静态表单，后台自动刷新会清掉正在输入的内容
+    if (auto && _currentView === 'settings') return;
+    const body = panelBodyElement;
+    if (!body) return;
+    listPagerCounter = 0;
+
+    const state = core.loadState();
+    const checkpoint = core.restoreCheckpoint();
+    const cpLayer = getCheckpointLayer(checkpoint);
+    const active = getActiveInjected(state, checkpoint);
+    const s = active.state;
+
+    const _wbListEl = document.getElementById('we-worldbook-list');
+    if (_wbListEl) _wbScrollTop = _wbListEl.scrollTop;
+
+    if (_currentView === 'home') {
+      body.innerHTML = isExpandMode()
+        ? renderHomeViewExpanded(s, active.layer, active.scope)
+        : renderHomeView(s, active.layer, active.scope);
+    } else if (_currentView === 'settings') {
+      body.innerHTML = renderSettingsView(checkpoint, cpLayer);
+    } else {
+      body.innerHTML = renderSubView(_currentView, s, active.layer, active.scope);
+    }
+
+    updatePanelHeader(s, active.layer);
+    bindEvents(state);
+  }
+
+  /**
+   * 世界稳定度（纯 UI 现算，只读，不写存档/不进 prompt/不返 API）
+   * 稳定度 = clamp(100 - 世界压力, 0, 100)
+   */
+  function computeWorldStability(state) {
+    state = state || {};
+    const round = Number(state.round) || 0;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    // 事件链：仅 Lv3/4，单条封顶 60
+    const CONFLICT_BASE = { 萌芽:0, 发酵:1, 逼近:2, 已爆发:4, 已消散:0 };
+    const PROGRESS_BASE = { 筹备:0, 执行:1, 关键:2, 已完成:-2, 已失败:0 };
+    let eventP = 0;
+    for (const e of (state.events || [])) {
+      const level = Number(e.level) || 1;
+      if (level < 3) continue;
+      const isProgress = e.type === 'progress';
+      const base = isProgress ? PROGRESS_BASE : CONFLICT_BASE;
+      const keepTotal = 2 + level * 2;
+      const remainFactor = () => {
+        if (e._terminalSince === undefined) return 1;
+        return clamp((keepTotal - (round - e._terminalSince)) / keepTotal, 0, 1);
+      };
+      let p;
+      if (e.stage === '已爆发') p = 4 * level * 0.5 * remainFactor();
+      else if (e.stage === '已完成') p = -2 * remainFactor();        // 不乘 level
+      else if (e.stage === '已消散' || e.stage === '已失败') p = 0;
+      else p = (base[e.stage] || 0) * level * 0.5;
+      if (e.stall) p *= 0.65;
+      eventP += clamp(p, -60, 60);
+    }
+
+    // 风声：仅 Lv3/4，总封顶 25
+    const WIND_BASE = { rumor:0.5, announcement:1, report:1.5, sentiment:2 };
+    let windP = 0;
+    for (const w of (state.winds || [])) {
+      const level = Number(w.level) || 1;
+      if (level < 3) continue;
+      windP += (WIND_BASE[w.type] || 0) * level;
+    }
+    windP = Math.min(windP, 25);
+
+    // 天下大势：每条持续中 +6，总封顶 20
+    let trendP = 0;
+    for (const t of (state.worldTrends || [])) if (t.status !== '已结束') trendP += 6;
+    trendP = Math.min(trendP, 20);
+
+    // 势力：关系值 × 状态系数，总封顶 35
+    const REL = { 血盟:-1.5, 盟友:-1, 友好:-0.5, 中立:0, 冷淡:0.5, 敌对:1, 世仇:1.5 };
+    const STAT = { 鼎盛:1.25, 稳固:1, 倾轧:0.75, 困顿:0.5, 衰落:0.25, 瓦解:0 };
+    let factionP = 0;
+    for (const f of (state.factions || [])) {
+      const rel = REL[f.relation] !== undefined ? REL[f.relation] : 0;
+      const st = STAT[f.status] !== undefined ? STAT[f.status] : 1;
+      factionP += rel * st;
+    }
+    factionP = clamp(factionP, -35, 35);
+
+    // 经济：只看 climate
+    const CLIMATE = { 繁荣:-2, 平稳:0, 衰退:1, 动荡:2 };
+    const econP = CLIMATE[(state.economy || {}).climate] || 0;
+
+    // 区域突发：激活 +5
+    const regionP = (state.regionalIncident && state.regionalIncident.active) ? 5 : 0;
+
+    // 仇敌、黑盒：按设定不计入世界稳定度
+
+    const pressure = eventP + windP + trendP + factionP + econP + regionP;
+    const stability = Number(clamp(100 - pressure, 0, 100).toFixed(1));
+    const tier =
+      stability >= 90 ? '天下太平' :
+      stability >= 70 ? '暗流浮动' :
+      stability >= 45 ? '局势紧张' :
+      stability >= 20 ? '动荡失序' : '崩坏边缘';
+
+    const r1 = v => Number(v.toFixed(1));
+    return {
+      stability, tier, pressure: r1(pressure),
+      breakdown: {
+        事件: r1(eventP), 风声: r1(windP), 大势: r1(trendP), 势力: r1(factionP),
+        经济: r1(econP), 区域: r1(regionP)
+      }
+    };
+  }
+
+  const STABILITY_TIER_COLOR = {
+    天下太平: '#69b68e', 暗流浮动: '#58b8a9', 局势紧张: '#d0aa58',
+    动荡失序: '#d98a3d', 崩坏边缘: '#ff0000'
+  };
+
+  // 稳定度档位 → 头部小字（诗句）
+  const STABILITY_TIER_MOOD = {
+    天下太平: '海静不扬波', 暗流浮动: '暗水带花流', 局势紧张: '云急风更恶',
+    动荡失序: '乾坤含疮痍', 崩坏边缘: '坤轴欹将折'
+  };
+
+  /** 刷新头部的「第X轮 + 稳定度小字」 */
+  function updatePanelHeader(state, layer) {
+    const roundEl = document.getElementById('we-header-round');
+    if (roundEl) {
+      const layerText = (layer !== undefined && layer !== null && layer !== '-') ? ' · 第 ' + layer + ' 层' : '';
+      roundEl.textContent = '第 ' + ((state && state.round) || 0) + ' 轮' + layerText;
+    }
+    const moodEl = document.getElementById('we-header-mood');
+    if (moodEl) {
+      const stab = computeWorldStability(state || {});
+      const color = STABILITY_TIER_COLOR[stab.tier] || '#58b8a9';
+      const text = STABILITY_TIER_MOOD[stab.tier] || '';
+      const dot = moodEl.querySelector('.we-header-dot');
+      const txt = moodEl.querySelector('.we-header-mood-text');
+      if (dot) { dot.style.background = color; dot.style.boxShadow = '0 0 6px ' + color; }
+      if (txt) { txt.textContent = text; txt.style.color = color; }
+    }
+  }
+
+  const VIEW_TITLES = {
+    situation: '局势', events: '事件', relations: '关系', resources: '资源', settings: '设置',
+    // ★ 新系统视图
+    achievements: '成就·战斗', world_board: '法则·故事', plot_board: '线索·情感'
+  };
+
+  function renderSection(title, id, content) {
+    return '<div class="we-section" id="we-sec-' + id + '"><div class="we-section-title">' + sectionHeader(title, id) + '</div>' + sectionBody(id, content) + '</div>';
+  }
+
+  function renderHomeView(s, layer, scope) {
+    const stab = computeWorldStability(s);
+    const tierColor = STABILITY_TIER_COLOR[stab.tier] || '#58b8a9';
+
+    const rows = [
+      { view: 'situation', label: '局势', sub: '天下大势 · 区域事件 · 账本', poem: '天下云集响应' },
+      { view: 'events',    label: '事件', sub: '事件链 · 风声 · 影响链',     poem: '事至而应' },
+      { view: 'relations', label: '关系', sub: '声誉 · 势力 · 仇敌录',       poem: '同声相应，同气相求' },
+      { view: 'characters',label: '人物', sub: 'NPC角色 · 活动日志 · 剧情线索', poem: '千人千面，各行其志' },
+      { view: 'resources', label: '资源', sub: '经济 · 秘密',               poem: '地藏无尽藏' },
+      // ★ 新系统导航
+      { view: 'achievements', label: '成就', sub: '成就解锁 · 战斗战绩 · 连击', poem: '功成名就' },
+      { view: 'world_board',  label: '世界', sub: '世界法则 · 故事方向 · 世界时间', poem: '天道有序' },
+      { view: 'plot_board',   label: '线索', sub: '全局线索板 · 情感地图',   poem: '草蛇灰线' },
+    ];
+
+    const navRows = rows.map((r, i) => {
+      const topLine = i === 0 ? '<div class="we-nav-line we-nav-line-hidden"></div>' : '<div class="we-nav-line"></div>';
+      const botLine = i === rows.length - 1 ? '<div class="we-nav-line we-nav-line-hidden"></div>' : '<div class="we-nav-line"></div>';
+      const sel = _selectedNavView === r.view ? ' we-nav-row--selected' : '';
+      return '<div class="we-nav-row' + sel + '" data-view="' + r.view + '">'
+        + '<div class="we-nav-label">' + r.label + '</div>'
+        + '<div class="we-nav-track">' + topLine + '<div class="we-nav-dot"></div>' + botLine + '</div>'
+        + '<div class="we-nav-content"><span class="we-nav-sub">' + r.sub + '</span><span class="we-nav-poem">' + r.poem + '</span></div>'
+        + '<i class="fa-solid fa-chevron-right we-nav-arrow"></i>'
+        + '</div>';
+    }).join('');
+
+    return renderWorldCore(s)
+      + '<div class="we-nav-list" style="--we-tier-color:' + tierColor + ';">' + navRows + '</div>'
+      + '<div class="we-section" id="we-sec-digest"><div class="we-section-title">世界摘要</div><div class="we-digest">' + u(s.worldDigest) + '</div></div>';
+  }
+
+  /** 展开模式主页：世界核心 + 世界摘要 + 所有 section 平铺（如存档点） */
+  function renderHomeViewExpanded(s, layer, scope) {
+    return renderWorldCore(s)
+      + '<div class="we-section" id="we-sec-digest"><div class="we-section-title">世界摘要</div><div class="we-digest">' + u(s.worldDigest) + '</div></div>'
+      + renderSection('天下大势', 'trends', renderWorldTrends(s.worldTrends, scope))
+      + renderSection('区域事件', 'regional', renderRegionalIncident(s.regionalIncident, scope))
+      + renderSection('事件链', 'events', renderEventList(s.events, scope))
+      + renderSection('风声', 'winds', renderWindList(s.winds, scope))
+      + renderSection('影响链', 'influence', renderInfluenceChain(s.influenceChain, scope))
+      + renderSection('声誉', 'reputation', renderReputation(s.reputation, scope))
+      + renderSection('势力', 'factions', renderFactionList(s.factions, scope))
+      + renderSection('仇敌录', 'enemies', renderEnemies(s.enemies, scope))
+      + renderSection('NPC角色', 'npcs', renderNpcs(s.npcs, scope))
+      + renderSection('经济', 'economy', renderEconomy(s.economy, scope))
+      + renderSection('秘密', 'blackbox', renderBlackbox(s.blackbox, scope))
+      + renderSection('事件账本', 'ledger', renderLedger(s.memories))
+      // ★ 新系统
+      + renderSection('成就', 'achievements', renderAchievementsPanel(s))
+      + renderSection('战斗战绩', 'combat_board', renderCombatBoard(s))
+      + renderSection('世界法则', 'worldlaws', renderWorldLawsPanel(s))
+      + renderSection('故事方向', 'storytype', renderStoryTypePanel(s))
+      + renderSection('世界时间', 'worldtime', renderWorldTimePanel(s))
+      + renderSection('全局线索板', 'globalplots', renderGlobalPlotBoard(s))
+      + renderSection('情感地图', 'emotionmap', renderEmotionMapPanel(s));
+  }
+
+  function renderSubView(viewKey, s, layer, scope) {
+    let content = '';
+    if (viewKey === 'situation') {
+      content = renderSection('天下大势', 'trends', renderWorldTrends(s.worldTrends, scope))
+        + renderSection('区域事件', 'regional', renderRegionalIncident(s.regionalIncident, scope))
+        + renderSection('事件账本', 'ledger', renderLedger(s.memories));
+    } else if (viewKey === 'events') {
+      content = renderSection('事件链', 'events', renderEventList(s.events, scope))
+        + renderSection('风声', 'winds', renderWindList(s.winds, scope))
+        + renderSection('影响链', 'influence', renderInfluenceChain(s.influenceChain, scope));
+    } else if (viewKey === 'relations') {
+      content = renderSection('声誉', 'reputation', renderReputation(s.reputation, scope))
+        + renderSection('势力', 'factions', renderFactionList(s.factions, scope))
+        + renderSection('仇敌录', 'enemies', renderEnemies(s.enemies, scope));
+    } else if (viewKey === 'characters') {
+      content = renderSection('NPC角色', 'npcs', renderNpcs(s.npcs, scope));
+    } else if (viewKey === 'resources') {
+      content = renderSection('经济', 'economy', renderEconomy(s.economy, scope))
+        + renderSection('秘密', 'blackbox', renderBlackbox(s.blackbox, scope));
+    } else if (viewKey === 'achievements') {
+      content = renderSection('成就', 'achievements', renderAchievementsPanel(s))
+        + renderSection('战斗战绩', 'combat_board', renderCombatBoard(s))
+        + renderSection('连击', 'combo_board', renderComboBoard(s));
+    } else if (viewKey === 'world_board') {
+      content = renderSection('世界法则', 'worldlaws', renderWorldLawsPanel(s))
+        + renderSection('故事方向', 'storytype', renderStoryTypePanel(s))
+        + renderSection('世界时间', 'worldtime', renderWorldTimePanel(s));
+    } else if (viewKey === 'plot_board') {
+      content = renderSection('全局线索板', 'globalplots', renderGlobalPlotBoard(s))
+        + renderSection('情感地图', 'emotionmap', renderEmotionMapPanel(s));
+    }
+    return '<div class="we-sub-topbar">'
+      + '<button class="we-icon-btn" id="we-btn-back" title="返回"><i class="fa-solid fa-arrow-left"></i></button>'
+      + '<span class="we-sub-title">' + (VIEW_TITLES[viewKey] || viewKey) + '</span>'
+      + '</div>' + content;
+  }
+
+  /** 存档点小标题：青色默认小字 + 「- N轮 - M层」 */
+  function checkpointTitle(checkpoint, cpLayer) {
+    if (!checkpoint) return '存档点';
+    const round = checkpoint.round || 0;
+    const layer = (cpLayer === undefined || cpLayer === null) ? '-' : cpLayer;
+    return '存档点 - ' + round + ' 轮 - ' + layer + ' 层';
+  }
+
+  function renderSettingsView(checkpoint, cpLayer) {
+    const cpContent = checkpoint
+      ? renderCheckpointSections(checkpoint, cpLayer)
+      : '<div class="we-empty">暂无存档点</div>';
+    return '<div class="we-sub-topbar">'
+      + '<button class="we-icon-btn" id="we-btn-back" title="返回"><i class="fa-solid fa-arrow-left"></i></button>'
+      + '<span class="we-sub-title">设置</span>'
+      + '</div>'
+      + renderSettingsForm()
+      + '<div class="we-section" style="margin-top:16px;"><div class="we-section-title">' + sectionHeader(checkpointTitle(checkpoint, cpLayer), 'checkpoint-section') + '</div>' + sectionBody('checkpoint-section', cpContent) + '</div>'
+      + '<div class="we-settings-save-actions">'
+      + '<button class="we-btn" id="we-save-settings">保存设置</button>'
+      + '<button class="we-btn we-btn-danger" id="we-reset-world">重置世界</button>'
+      + '</div>'
+      + renderSettingsAfterCheckpoint()
+      + '<div class="we-section we-debug-section" style="margin-top:8px;">'
+      + '<div class="we-section-title"><span class="we-debug-toggle" title="展开或收起调试信息"><span class="we-toggle-arrow">▶</span>调试</span></div>'
+      + '<div id="we-debug-body" style="display:none;">' + renderDebug() + '</div></div>';
+  }
+
+  function renderCheckpointSections(s, layer) {
+    return renderSection('天下大势', 'cp-trends', renderWorldTrends(s.worldTrends, 'checkpoint'))
+      + renderSection('事件链', 'cp-events', renderEventList(s.events, 'checkpoint'))
+      + renderSection('势力', 'cp-factions', renderFactionList(s.factions, 'checkpoint'))
+      + renderSection('风声', 'cp-winds', renderWindList(s.winds, 'checkpoint'))
+      + renderSection('声誉', 'cp-reputation', renderReputation(s.reputation, 'checkpoint'))
+      + renderSection('经济', 'cp-economy', renderEconomy(s.economy, 'checkpoint'))
+      + renderSection('仇敌录', 'cp-enemies', renderEnemies(s.enemies, 'checkpoint'))
+      + renderSection('NPC角色', 'cp-npcs', renderNpcs(s.npcs, 'checkpoint'))
+      + renderSection('影响链', 'cp-influence', renderInfluenceChain(s.influenceChain, 'checkpoint'))
+      + renderSection('区域事件', 'cp-regional', renderRegionalIncident(s.regionalIncident, 'checkpoint'))
+      + renderSection('秘密', 'cp-blackbox', renderBlackbox(s.blackbox, 'checkpoint'))
+      + renderSection('事件账本', 'cp-ledger', renderLedger(s.memories));
+  }
+
+  /** 世界核心：环形稳定度仪表 + 四格关键计数 */
+  function renderWorldCore(s) {
+    const stab = computeWorldStability(s);
+    const tierColor = STABILITY_TIER_COLOR[stab.tier] || '#58b8a9';
+    const detail = Object.entries(stab.breakdown)
+      .filter(([, v]) => v !== 0)
+      .map(([k, v]) => `${k} ${v > 0 ? '+' : ''}${v}`).join('　') || '无压力来源';
+
+    const R = 66, C = 2 * Math.PI * R;
+    const pct = Math.max(0, Math.min(1, stab.stability / 100));
+    const dash = (pct * C).toFixed(1);
+    const theta = (pct * 360 - 90) * Math.PI / 180;       // 从正上方起、顺时针
+    const dotX = (80 + R * Math.cos(theta)).toFixed(1);
+    const dotY = (80 + R * Math.sin(theta)).toFixed(1);
+    const dashNum = Number(dash);
+
+    function arcPoint(angleDeg) {
+      const rad = angleDeg * Math.PI / 180;
+      return {
+        x: 80 + R * Math.cos(rad),
+        y: 80 + R * Math.sin(rad)
+      };
+    }
+
+    function arcPath(startDeg, endDeg) {
+      const a = arcPoint(startDeg);
+      const b = arcPoint(endDeg);
+      const largeArc = Math.abs(endDeg - startDeg) > 180 ? 1 : 0;
+      return `M ${a.x.toFixed(2)} ${a.y.toFixed(2)} A ${R} ${R} 0 ${largeArc} 1 ${b.x.toFixed(2)} ${b.y.toFixed(2)}`;
+    }
+
+    const tailDeg = Math.min(36, pct * 360);
+    const tailSegs = 36;
+    let tailGlow = '';
+
+    for (let i = 0; i < tailSegs; i++) {
+      const t1 = i / tailSegs;
+      const t2 = (i + 1) / tailSegs;
+
+      const startDeg = -90 + pct * 360 - tailDeg + t1 * tailDeg;
+      const endDeg = -90 + pct * 360 - tailDeg + t2 * tailDeg;
+
+      const alpha = Math.pow(t2, 2.2) * 0.72;
+
+      tailGlow += `
+        <path d="${arcPath(startDeg, endDeg)}"
+          fill="none"
+          stroke="#ffffff"
+          stroke-width="6"
+          stroke-linecap="butt"
+          opacity="${alpha.toFixed(3)}"/>
+      `;
+    }
+
+    const stats = [
+      ['事件', (s.events || []).length],
+      ['势力', (s.factions || []).length],
+      ['风声', (s.winds || []).length],
+      ['大势', (s.worldTrends || []).length],
+    ].map(([k, v]) => `<div class="we-core-stat"><div class="we-core-stat-k">${k}</div><div class="we-core-stat-v">${v}</div></div>`).join('');
+
+    return `
+      <div class="we-section we-core-section">
+        <div class="we-core" title="各来源压力（仅 Lv3/4 计入）：${detail}　|　压力 ${stab.pressure}">
+          <div class="we-core-ring">
+            <svg viewBox="0 0 160 160" width="160" height="160">
+              <defs>
+                <filter id="weCoreDotGlow" x="-80%" y="-80%" width="260%" height="260%">
+                  <feGaussianBlur stdDeviation="3.2"/>
+                </filter>
+              </defs>
+
+              <circle cx="80" cy="80" r="${R}" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="6"/>
+
+              <circle cx="80" cy="80" r="${R}" fill="none" stroke="${tierColor}" stroke-width="6"
+                stroke-linecap="round"
+                stroke-dasharray="${dash} ${(C - pct * C).toFixed(1)}"
+                transform="rotate(-90 80 80)"/>
+
+              ${tailGlow}
+
+              <circle class="we-core-dot-glow" cx="${dotX}" cy="${dotY}" r="8" fill="#ffffff" opacity="0.14" filter="url(#weCoreDotGlow)"/>
+              <circle cx="${dotX}" cy="${dotY}" r="4.6" fill="#e8fffb" opacity="0.70"/>
+              <circle class="we-core-dot-core" cx="${dotX}" cy="${dotY}" r="2.5" fill="#ffffff" opacity="0.95"/>
+            </svg>
+            <div class="we-core-center">
+              <div class="we-core-title">世界核心</div>
+              <div class="we-core-sub">稳定度</div>
+              <div class="we-core-pct" style="color:${tierColor};">${stab.stability.toFixed(1)}<span>%</span></div>
+              <div class="we-core-tier" style="color:${tierColor};">${stab.tier}</div>
+            </div>
+          </div>
+          <div class="we-core-stats">${stats}</div>
+        </div>
+      </div>`;
+  }
+
+  /** 获取存档点的对话层数 */
+  function getCheckpointLayer(cp) {
+    if (!cp) return '-';
+    return Number.isFinite(Number(cp.chatLayer)) ? Number(cp.chatLayer) : '-';
+  }
+
+  function renderPagedList(items, key, renderItem, perPage = 4) {
+    const rid = `we-list-${key}-${++listPagerCounter}`;
+    const totalPages = Math.ceil(items.length / perPage);
+    const currentPage = Math.min(totalPages, Math.max(1, listPageState[rid] || 1));
+    listPageState[rid] = currentPage;
+    const pager = totalPages > 1
+      ? `<div class="we-list-pager">
+          <span class="we-list-arrow" data-rid="${rid}" data-dir="-1">◀</span>
+          <span class="we-list-page"><span class="we-list-cur">${currentPage}</span>/${totalPages}</span>
+          <span class="we-list-arrow" data-rid="${rid}" data-dir="1">▶</span>
+        </div>`
+      : '';
+    return pager + `<div class="we-paged-list" data-rid="${rid}">` + items.map((item, index) => {
+      const page = Math.floor(index / perPage) + 1;
+      return `<div class="we-page-item" data-page="${page}" style="${page !== currentPage ? 'display:none;' : ''}">${renderItem(item, index)}</div>`;
+    }).join('') + '</div>';
+  }
+
+  function renderEventList(events, scope) {
+    if (!events || !events.length) return '<div class="we-empty">暂无事件链</div>';
+    const curRound = (core.loadState() || {}).round || 0;
+    return renderPagedList(events, 'events-' + scope, (e, eventIndex) => {
+      const stageColors = {
+        萌芽:'#d6b85a',
+        发酵:'#d98a3d',
+        逼近:'#cf5f3f',
+        已爆发:'#b93f3f',
+        已消散:'#888888',
+        筹备:'#7de9d9',
+        执行:'#58e8b3',
+        关键:'#2a8a5d',
+        已完成:'#1b5e3b',
+        已失败:'#888888',
+        停滞:'#6688aa'
+      };
+      const levelColors = {
+        1: '#c0c0c0',
+        2: '#f2f2f2',
+        3: '#c9a45c',
+        4: '#df7cff'
+      };
+      const color = stageColors[e.stage] || '#888';
+      const levelColor = levelColors[e.level] || '#9aa6b2';
+      let extras = '';
+      const terminalStages = e.type === 'progress' ? ['已完成', '已失败'] : ['已爆发', '已消散'];
+      const isTerminal = terminalStages.includes(e.stage);
+      if (e.consecutiveFails > 0 && !isTerminal) {
+        const maxFails = e.type === 'progress' ? 2 + (e.level || 1) : 6 - (e.level || 1);
+        extras += ` <span class="we-badge" style="background:#6662;color:#888;">${e.consecutiveFails}/${maxFails}</span>`;
+      }
+      if (e.stall && !isTerminal) {
+        extras += ' <span class="we-badge" style="background:#6688aa22;color:#6688aa;">停滞</span>';
+      }
+      let metaExtra = '';
+      if (e.evolveResult && !isTerminal) {
+        const resultColors = { '成功':'#7a9a7a', '保持':'#b8a070', '受挫':'#c46a6a' };
+        const color = resultColors[e.evolveResult] || '#888';
+        metaExtra = ` <span class="we-badge" style="background:${color}22;color:${color};">${e.evolveResult}</span>`;
+      }
+      // 阶段进度条
+      let progressHtml = '';
+      if (!isTerminal) {
+        const pct = Math.round((e.stageRound / 9) * 100);
+
+        const progressMotionClass = {
+          '成功': 'we-event-progress-success',
+          '保持': 'we-event-progress-hold',
+          '受挫': 'we-event-progress-fail'
+        }[e.evolveResult] || '';
+
+        progressHtml = `<div class="we-event-progress ${progressMotionClass}">
+          <div style="width:${pct}%;background:${color};"></div>
+        </div>`;
+      }
+      const typeName = e.type === 'progress' ? '推进型' : '冲突型';
+      const typeColor = e.type === 'progress' ? '#57b7a8' : '#cf5f3f';
+      // 正面终局倒计时徽标（已爆发/已完成，保留 2+level*2 轮后自动清退）
+      let countdownHtml = '';
+      const POSITIVE_TERMINALS = ['已爆发', '已完成'];
+      if (POSITIVE_TERMINALS.includes(e.stage) && e._terminalSince !== undefined) {
+        const keepRounds = 2 + (e.level || 1) * 2;
+        const left = keepRounds - (curRound - e._terminalSince) + 1;
+        if (left >= 1) {
+          const cdColor = e.stage === '已完成' ? '#58e8b3' : '#e07465';
+          countdownHtml = ` <span class="we-badge we-event-countdown" style="color:${cdColor};" title="该事件在 ${left} 轮后自动清退"><i class="fa-regular fa-clock"></i>剩余${left}轮</span>`;
+        }
+      }
+      const terminalStamp = {
+        已完成: { text: '完成', color: '#58e8b3' },
+        已爆发: { text: '爆发', color: '#e07465' },
+        已消散: { text: '消散', color: '#a6a6ad' },
+        已失败: { text: '失败', color: '#c08aaa' }
+      }[e.stage];
+      const isEditing = editingEvent?.scope === scope && editingEvent?.index === eventIndex;
+      // 颜色作为 CSS 变量下放，描边/底色/光效全交由样式层处理（不再内联左色条）
+      const itemStyle = `--event-accent:${color};--event-type:${typeColor};--event-level:${levelColor};`;
+      const stageClassMap = {
+        萌芽: 'we-stage-sprout', 发酵: 'we-stage-ferment', 逼近: 'we-stage-loom',
+        已爆发: 'we-stage-erupt', 已消散: 'we-stage-fade',
+        已完成: 'we-stage-done', 已失败: 'we-stage-failed',
+      };
+      const stageClass = stageClassMap[e.stage] || '';
+      const itemClass = (isTerminal ? 'we-event-item we-event-item-terminal' : 'we-event-item') + (stageClass ? ' ' + stageClass : '');
+      const metaStyle = isTerminal
+        ? 'style="color:var(--we-text2);"'
+        : '';
+      const stageBadge = isTerminal ? '' : ` <span class="we-badge" style="background:${color}22;color:${color};">${e.stage}</span>`;
+      const metaText = isTerminal
+        ? (e.desc ? u(e.desc) : '')
+        : `${e.stageRound||1}/9 ${e.desc ? '— '+u(e.desc) : ''}${metaExtra}`;
+      const stampHtml = isTerminal && terminalStamp
+        ? `<div class="we-event-stamp" style="border-color:${terminalStamp.color};color:${terminalStamp.color};">${terminalStamp.text}</div>`
+        : '';
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-event-delete" data-event-scope="${scope}" data-event-index="${eventIndex}" title="删除事件"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-event-copy" data-event-scope="${scope}" data-event-index="${eventIndex}" title="复制事件"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-event-edit" data-event-scope="${scope}" data-event-index="${eventIndex}" title="修改事件"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderEventEditor(e, scope, eventIndex) : '';
+      return `<div class="${itemClass}" style="${itemStyle}">
+        ${stampHtml}
+        <div class="we-event-name"><span style="color:${levelColor};">${u(e.name)}</span> <span class="we-badge" style="background:${levelColor}22;color:${levelColor};">Lv.${e.level||'?'}</span> <span class="we-badge" style="background:${typeColor}22;color:${typeColor};">${typeName}</span>${countdownHtml}${stageBadge}${extras}</div>
+        ${metaText ? `<div class="we-event-meta" ${metaStyle}>${metaText}</div>` : ''}
+        ${editHtml}
+        ${actionHtml}
+        ${progressHtml}
+      </div>`;
+    });
+  }
+
+  function renderEventEditor(event, scope, eventIndex) {
+    const stages = event.type === 'progress'
+      ? ['筹备', '执行', '关键', '已完成', '已失败']
+      : ['萌芽', '发酵', '逼近', '已爆发', '已消散'];
+    const levelOptions = [1, 2, 3, 4].map(level =>
+      `<option value="${level}" ${Number(event.level) === level ? 'selected' : ''}>Lv.${level}</option>`
+    ).join('');
+    const typeOptions = [
+      ['conflict', '冲突型'],
+      ['progress', '推进型']
+    ].map(([type, label]) =>
+      `<option value="${type}" ${event.type === type ? 'selected' : ''}>${label}</option>`
+    ).join('');
+    const stageOptions = stages.map(stage =>
+      `<option value="${stage}" ${event.stage === stage ? 'selected' : ''}>${stage}</option>`
+    ).join('');
+
+    // 正面终局倒计时：默认值取当前剩余，非终局事件留空
+    const POSITIVE_TERMINALS = ['已爆发', '已完成'];
+    const keepRounds = 2 + (Number(event.level) || 1) * 2;
+    let leftValue = '';
+    if (POSITIVE_TERMINALS.includes(event.stage)) {
+      const curRound = (core.loadState() || {}).round || 0;
+      const left = event._terminalSince !== undefined
+        ? keepRounds - (curRound - event._terminalSince) + 1
+        : keepRounds;
+      leftValue = Math.min(keepRounds, Math.max(1, left));
+    }
+
+    return `
+      <div class="we-event-editor" data-event-scope="${scope}" data-event-index="${eventIndex}">
+        <button class="we-event-editor-close" title="取消修改"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">事件名字<input class="we-event-edit-name" type="text" value="${u(event.name || '')}"></label>
+          <label>等级<select class="we-event-edit-level">${levelOptions}</select></label>
+          <label>类型<select class="we-event-edit-type">${typeOptions}</select></label>
+          <label>阶段<select class="we-event-edit-stage">${stageOptions}</select></label>
+          <label>阶段进度<input class="we-event-edit-round" type="number" min="1" max="9" value="${event.stageRound || 1}"></label>
+          <label title="仅正面终局（已爆发/已完成）生效，到期自动清退；非终局留空">剩余轮数<input class="we-event-edit-left" type="number" min="1" placeholder="终局专用" value="${leftValue}"></label>
+          <label class="we-event-editor-wide">描述<textarea class="we-event-edit-desc" rows="3">${u(event.desc || '')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-event-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderFactionList(factions, scope) {
+    if (!factions || !factions.length) return '<div class="we-empty">暂无势力</div>';
+    return renderPagedList(factions, 'factions', (f, factionIndex) => {
+      const relationColors = {
+        血盟:'#2563eb', 盟友:'#0ea5e9', 友好:'#06b6d4', 中立:'#94a3b8',
+        冷淡:'#f59e0b', 紧张:'#f59e0b', 敌对:'#ef4444', 世仇:'#991b1b'
+      };
+      const statusColors = { 鼎盛:'#d0aa58', 稳固:'#69b68e', 倾轧:'#cf5f3f', 困顿:'#70a8d2', 衰落:'#a6a6ad', 瓦解:'#888888' };
+      const relColor = relationColors[f.relation] || '#888';
+      const stColor = statusColors[f.status] || '#888';
+
+      const isEditing = editingFaction && editingFaction.scope === scope && editingFaction.index === factionIndex;
+
+      let pillarsHtml = '';
+      if (f.powerPillars && f.powerPillars.length) {
+        pillarsHtml = '<div class="we-faction-meta">权力支柱: ' + f.powerPillars.map(p => '<span class="we-pillar-tag">' + u(p) + '</span>').join('') + '</div>';
+      }
+
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-faction-delete" data-faction-scope="${scope}" data-faction-index="${factionIndex}" title="删除势力"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-faction-copy" data-faction-scope="${scope}" data-faction-index="${factionIndex}" title="复制势力"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-faction-edit" data-faction-scope="${scope}" data-faction-index="${factionIndex}" title="编辑势力"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderFactionEditor(f, factionIndex, scope) : '';
+
+      return `<div class="we-faction-item">
+        <div class="we-faction-name">${u(f.name)}</div>
+        <div class="we-faction-tags">
+          <span class="we-tag" style="border-color:${stColor};color:${stColor};">${f.status||'稳固'}</span>
+          <span class="we-tag" style="border-color:${relColor};color:${relColor};">${f.relation||'中立'}</span>
+          ${f.scope ? '<span class="we-tag">' + u(f.scope) + '</span>' : ''}
+        </div>
+        ${f.currentGoal ? `<div class="we-faction-goal">${u(f.currentGoal)}</div>` : ''}
+        ${f.core_person ? `<div class="we-faction-meta">核心人物: ${u(f.core_person)}</div>` : ''}
+        ${pillarsHtml}
+        ${actionHtml}
+        ${editHtml}
+      </div>`;
+    });
+  }
+
+  function renderFactionEditor(f, index, scope) {
+    const statusOptions = ['鼎盛','稳固','倾轧','困顿','衰落','瓦解'].map(s =>
+      `<option value="${s}" ${f.status === s ? 'selected' : ''}>${s}</option>`).join('');
+    const relationOptions = ['血盟','盟友','友好','中立','冷淡','敌对','世仇'].map(r =>
+      `<option value="${r}" ${f.relation === r ? 'selected' : ''}>${r}</option>`).join('');
+    const pillars = [];
+    for (let i = 0; i < 3; i++) pillars.push(f.powerPillars?.[i] || '');
+
+    return `
+      <div class="we-event-editor" data-faction-scope="${scope}" data-faction-index="${index}">
+        <button class="we-event-editor-close we-faction-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">势力名称<input class="we-faction-edit-name" type="text" value="${u(f.name||'')}"></label>
+          <label>运势<select class="we-faction-edit-status">${statusOptions}</select></label>
+          <label>关系<select class="we-faction-edit-relation">${relationOptions}</select></label>
+          <label>范围<input class="we-faction-edit-scope" type="text" value="${u(f.scope||'')}"></label>
+          <label>目标<input class="we-faction-edit-goal" type="text" value="${u(f.currentGoal||'')}"></label>
+          <label>核心人物<input class="we-faction-edit-core" type="text" value="${u(f.core_person||'')}"></label>
+          ${[0,1,2].map(i => `<label>权力支柱${i+1}<input class="we-faction-edit-pillar" data-pillar-idx="${i}" type="text" value="${u(pillars[i])}" maxlength="4" placeholder="最多4字"></label>`).join('')}
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-faction-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderWorldTrends(trends, scope) {
+    if (!trends || !trends.length) return '<div class="we-empty">暂无天下大势</div>';
+    return renderPagedList(trends, 'world-trends', (trend, trendIndex) => {
+      const ended = trend.status === '已结束';
+      const color = ended ? '#888888' : '#c9a45c';
+      const isEditing = editingTrend?.scope === scope && editingTrend?.index === trendIndex;
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-trend-delete" data-trend-scope="${scope}" data-trend-index="${trendIndex}" title="删除天下大势"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-trend-copy" data-trend-scope="${scope}" data-trend-index="${trendIndex}" title="复制天下大势"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-trend-edit" data-trend-scope="${scope}" data-trend-index="${trendIndex}" title="编辑天下大势"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderTrendEditor(trend, scope, trendIndex) : '';
+      return `<div class="we-trend-item${ended ? ' we-trend-ended' : ''}" style="border-left-color:${color};">
+        ${actionHtml}
+        <div class="we-trend-header">
+          <span class="we-trend-name">${u(trend.name)}</span>
+          <span class="we-badge" style="background:${color}22;color:${color};">${u(trend.status || '持续中')}</span>
+        </div>
+        <div class="we-trend-scope">${u(trend.scope || '天下')}</div>
+        <div class="we-trend-description">${u(trend.description || '?')}</div>
+        <div class="we-trend-source"><span>来源</span>${u(trend.source || '?')}</div>
+        ${editHtml}
+      </div>`;
+    });
+  }
+
+  function renderTrendEditor(trend, scope, index) {
+    const statusOptions = ['持续中', '已结束'].map(s =>
+      `<option value="${s}" ${trend.status === s ? 'selected' : ''}>${s}</option>`).join('');
+    return `
+      <div class="we-event-editor" data-trend-scope="${scope}" data-trend-index="${index}">
+        <button class="we-event-editor-close we-trend-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">大势名称<input class="we-trend-edit-name" type="text" value="${u(trend.name||'')}"></label>
+          <label>状态<select class="we-trend-edit-status">${statusOptions}</select></label>
+          <label>范围<input class="we-trend-edit-scope" type="text" value="${u(trend.scope||'')}"></label>
+          <label>来源<input class="we-trend-edit-source" type="text" value="${u(trend.source||'')}"></label>
+          <label class="we-event-editor-wide">描述<textarea class="we-trend-edit-desc" rows="3">${u(trend.description||'')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-trend-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderWindList(winds, scope) {
+    if (!winds || !winds.length) return '<div class="we-empty">暂无风声</div>';
+    const typeNames = { announcement:'公告', report:'消息', rumor:'流言', sentiment:'舆情' };
+    const typeColors = { announcement:'#c94b4b', report:'#4a8ab5', rumor:'#9178a0', sentiment:'#c17a35' };
+    return renderPagedList(winds, 'winds', (w, windIndex) => {
+      const typeColor = typeColors[w.type] || '#888';
+      // 等级徽章：Lv1/2 中性灰，Lv3/4 取类型本色（与风声四态配色统一）
+      const levelColor = (w.level >= 3) ? typeColor : (w.level === 2 ? '#7a828c' : '#5a6270');
+      const isEditing = editingWind && editingWind.scope === scope && editingWind.index === windIndex;
+
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-wind-delete" data-wind-scope="${scope}" data-wind-index="${windIndex}" title="删除风声"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-wind-copy" data-wind-scope="${scope}" data-wind-index="${windIndex}" title="复制风声"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-wind-edit" data-wind-scope="${scope}" data-wind-index="${windIndex}" title="编辑风声"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderWindEditor(w, windIndex, scope) : '';
+
+      const windTypeClass = { announcement:'we-wind-announcement', report:'we-wind-report', rumor:'we-wind-rumor', sentiment:'we-wind-sentiment' }[w.type] || '';
+      const windLvClass = 'we-wind-lv' + (w.level || 1);
+      let html = '<div class="we-wind-item ' + windTypeClass + ' ' + windLvClass + '" style="--wind-accent:' + typeColor + ';--wind-level-color:' + levelColor + ';">';
+      // Lv4 专属装饰元素：公告双冲击环 / 流言双焦点多圈涟漪
+      if (w.level === 4) {
+        if (w.type === 'announcement') {
+          html += '<span class="we-wind-ring"></span><span class="we-wind-ring we-wind-ring2"></span>';
+        } else if (w.type === 'rumor') {
+          html += '<span class="we-wind-rp we-rp-a1"></span><span class="we-wind-rp we-rp-a2"></span><span class="we-wind-rp we-rp-a3"></span><span class="we-wind-rp we-rp-b1"></span><span class="we-wind-rp we-rp-b2"></span>';
+        }
+      }
+      html += '<div class="we-wind-header">';
+      html += '<span class="we-wind-topic">' + u(w.topic || '未命名风声') + '</span>';
+      html += '<span class="we-badge" style="background:' + typeColor + '22;color:' + typeColor + ';">' + (typeNames[w.type] || '风声') + '</span>';
+      html += '<span class="we-badge" style="background:' + levelColor + '22;color:' + levelColor + ';">Lv.' + (w.level || 1) + '</span>';
+      html += '</div>';
+      html += '<div class="we-wind-field we-wind-content"><span class="we-wind-label">内容</span><span>' + u(w.content || '?') + '</span></div>';
+      html += '<div class="we-wind-field"><span class="we-wind-label">范围</span><span>' + u(w.scope || '?') + '</span></div>';
+      html += '<div class="we-wind-field"><span class="we-wind-label">来源</span><span>' + u(w.source || '?') + '</span></div>';
+      html += editHtml;
+      html += actionHtml;
+      html += '</div>';
+      return html;
+    });
+  }
+
+  function renderWindEditor(w, index, scope) {
+    const typeOptions = [['announcement','公告'],['report','消息'],['rumor','流言'],['sentiment','舆情']].map(([v,label]) =>
+      `<option value="${v}" ${w.type === v ? 'selected' : ''}>${label}</option>`).join('');
+    const levelOptions = [1,2,3,4].map(l =>
+      `<option value="${l}" ${w.level === l ? 'selected' : ''}>Lv.${l}</option>`).join('');
+
+    return `
+      <div class="we-event-editor" data-wind-index="${index}" data-wind-scope="${scope}">
+        <button class="we-event-editor-close we-wind-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">主题<input class="we-wind-edit-topic" type="text" value="${u(w.topic||'')}"></label>
+          <label>类型<select class="we-wind-edit-type">${typeOptions}</select></label>
+          <label>等级<select class="we-wind-edit-level">${levelOptions}</select></label>
+          <label>范围<input class="we-wind-edit-scope" type="text" value="${u(w.scope||'')}"></label>
+          <label>来源<input class="we-wind-edit-source" type="text" value="${u(w.source||'')}"></label>
+          <label class="we-event-editor-wide">内容<textarea class="we-wind-edit-content" rows="3">${u(w.content||'')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-wind-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderReputation(rep, scope) {
+    if (!rep) return '<div class="we-empty">暂无声誉数据</div>';
+    const levels = ['天怒人怨','声名狼藉','默默无闻','受人尊敬','万众敬仰'];
+    const levelColors = { '天怒人怨':'#e05555', '声名狼藉':'#d97a5a', '默默无闻':'#7a8a9a', '受人尊敬':'#6cae8e', '万众敬仰':'#c9a45c' };
+    const legacyMap = { '小有名气':'受人尊敬' };
+    const dimLabels = { authority:'朝堂', common:'市井', shadow:'草莽', circuit:'同道' };
+    // 各维度 × 各等级的随附古文（出处略）
+    const quotes = {
+      authority: { '天怒人怨':'上下疾之如仇', '声名狼藉':'在位皆言其恶', '默默无闻':'沉于下寮不见知', '受人尊敬':'群臣莫不敬惮', '万众敬仰':'天下想望其风采' },
+      common:    { '天怒人怨':'行人指目相戒', '声名狼藉':'里中无赖子亦耻之', '默默无闻':'出入市廛人莫识', '受人尊敬':'闾里称其长者', '万众敬仰':'儿童走卒皆知其名' },
+      shadow:    { '天怒人怨':'绿林亦不肯纳', '声名狼藉':'豪杰闻而鄙之', '默默无闻':'混迹渔樵无人问', '受人尊敬':'江湖豪杰多归之', '万众敬仰':'四海之内皆称其侠' },
+      circuit:   { '天怒人怨':'同辈羞与为伍', '声名狼藉':'友朋面斥其非', '默默无闻':'独行无人与语', '受人尊敬':'同门推为领袖', '万众敬仰':'吾辈望之如泰山' }
+    };
+    return '<div class="we-rep-grid">' + Object.entries(rep).filter(([k]) => k !== 'lastChange').map(([key, rawVal]) => {
+      const val = legacyMap[rawVal] || rawVal;
+      const cn = dimLabels[key] || key;
+      const idx = levels.indexOf(val);
+      const color = levelColors[val] || '#888';
+      const quote = (quotes[key] && quotes[key][val]) || '';
+      const dotsHtml = levels.map((l, i) => {
+        const active = i <= idx ? ' we-rep-dot-active' : '';
+        const dotColor = i <= idx ? color : '#444';
+        return `<span class="we-rep-dot${active}" style="background:${dotColor};" data-rep-scope="${scope || 'state'}" data-dim="${key}" data-level="${l}" title="${l}"></span>`;
+      }).join('');
+      return `<div class="we-rep-row">
+        <span class="we-rep-dim">${cn}</span>
+        <div class="we-rep-dots">${dotsHtml}</div>
+        <span class="we-rep-quote" style="color:${color}">${quote}</span>
+      </div>`;
+    }).join('') + '</div>';
+  }
+
+  function renderEconomy(econ, scope) {
+    if (!econ) return '<div class="we-empty">暂无经济数据</div>';
+    const sc = scope || 'state';
+    const climates = ['繁荣','平稳','衰退','动荡'];
+    const climateColors = { '繁荣': '#3ecf8e', '平稳': '#7a8a9a', '衰退': '#d9a34a', '动荡': '#e05555' };
+    const climateBg = { '繁荣': 'rgba(62,207,142,0.08)', '平稳': 'rgba(122,138,154,0.06)', '衰退': 'rgba(217,163,74,0.08)', '动荡': 'rgba(224,85,85,0.08)' };
+    const climate = econ.climate || '平稳';
+    const cColor = climateColors[climate] || '#7a8a9a';
+    let html = '<div class="we-climate-bar" style="background:' + (climateBg[climate]||'rgba(122,138,154,0.06)') + ';">';
+    html += '<span class="we-climate-dot" style="background:' + cColor + ';box-shadow:0 0 8px ' + cColor + '88;"></span>';
+    html += '<span class="we-climate-label" style="color:' + cColor + '">' + climate + '</span>';
+    html += '<div class="we-climate-btns">';
+    for (const c of climates) {
+      html += '<span class="we-climate-btn' + (c === climate ? ' we-climate-btn-on' : '') + '" style="' + (c === climate ? ('color:'+(climateColors[c]||'#7a8a9a')+';border-color:'+(climateColors[c]||'#7a8a9a')) : '') + '" data-climate-scope="' + sc + '" data-climate="' + c + '">' + c + '</span>';
+    }
+    html += '</div></div>';
+    if (econ.signals?.length) {
+      html += renderPagedList(econ.signals, 'economy-signals', (s, i) =>
+        '<div class="we-signal-item" data-sig-scope="' + sc + '">' +
+        '<span class="we-signal-summary">' + u(s.summary||s) + '</span>' +
+        '<span class="we-signal-scope">' + u(s.scope||'?') + '</span>' +
+        '<span class="we-signal-del" data-sig-scope="' + sc + '" data-sigidx="' + i + '" title="删除信号">✕</span>' +
+        '</div>'
+      );
+    } else {
+      html += '<div class="we-empty" style="margin-top:4px;">暂无市场信号</div>';
+    }
+    html += '<div class="we-signal-add" data-sig-scope="' + sc + '"><i class="fa-solid fa-plus"></i> 添加信号</div>';
+    return html;
+  }
+
+  function renderEnemies(enemiesList, scope) {
+    if (!enemiesList || !enemiesList.length) return '<div class="we-empty">暂无仇敌</div>';
+    return renderPagedList(enemiesList, 'enemies', (en, enemyIndex) => {
+      const isEditing = editingEnemy?.scope === scope && editingEnemy?.index === enemyIndex;
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-enemy-delete" data-enemy-scope="${scope}" data-enemy-index="${enemyIndex}" title="删除仇敌"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-enemy-copy" data-enemy-scope="${scope}" data-enemy-index="${enemyIndex}" title="复制仇敌"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-enemy-edit" data-enemy-scope="${scope}" data-enemy-index="${enemyIndex}" title="编辑仇敌"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderEnemyEditor(en, enemyIndex, scope) : '';
+      return `<div class="we-blood-item">
+        ${actionHtml}
+        <div class="we-blood-title">${u(en.name)} <span class="we-badge we-badge-danger">${en.status||'追踪中'}</span><span class="we-badge" style="background:var(--we-purple);font-size:10px;">${en.type==='blood'?'血仇':'恩怨'}</span></div>
+        <div class="we-blood-meta">原因: ${u(en.reason||'?')}</div>
+        ${editHtml}
+      </div>`;
+    });
+  }
+
+  function renderEnemyEditor(en, index, scope) {
+    const typeOptions = [['blood','血仇'],['grudge','恩怨']].map(([v,label]) =>
+      `<option value="${v}" ${en.type === v ? 'selected' : ''}>${label}</option>`).join('');
+    const statusOptions = ['追踪中','策划中','执行中','已终结'].map(s =>
+      `<option value="${s}" ${en.status === s ? 'selected' : ''}>${s}</option>`).join('');
+    return `
+      <div class="we-event-editor" data-enemy-scope="${scope}" data-enemy-index="${index}">
+        <button class="we-event-editor-close we-enemy-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">仇敌名称<input class="we-enemy-edit-name" type="text" value="${u(en.name||'')}"></label>
+          <label>类型<select class="we-enemy-edit-type">${typeOptions}</select></label>
+          <label>状态<select class="we-enemy-edit-status">${statusOptions}</select></label>
+          <label class="we-event-editor-wide">原因<textarea class="we-enemy-edit-reason" rows="2">${u(en.reason||'')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-enemy-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  // ========== ★ 新系统渲染函数 ==========
+
+  function renderAchievementsPanel(s) {
+    const ach = s.achievements || {};
+    const unlocked = ach.unlocked || {};
+    const total = ach.totalUnlocked || Object.keys(unlocked).length;
+    if (!total && !ach.autoGenerated) return '<div class="we-empty">暂无成就</div>';
+    let html = '<div style="font-size:11px;color:#8e99a4;margin-bottom:4px;">已解锁 ' + total + ' 个成就</div>';
+    const entries = Object.entries(unlocked);
+    if (entries.length) {
+      html += entries.slice(-15).reverse().map(function(entry) {
+        var ach = entry[1];
+        return '<div style="font-size:11px;color:#c0c8d4;padding:2px 0;border-bottom:1px solid rgba(88,184,169,0.15);">'
+          + '<span style="color:#58b8a9;">' + (ach.icon || '🏆') + '</span> '
+          + '<strong>' + u(ach.title || entry[0]) + '</strong>'
+          + (ach.desc ? ' — ' + u(ach.desc) : '')
+          + (ach.note ? ' <span style="color:#666;">(' + u(ach.note) + ')</span>' : '')
+          + '</div>';
+      }).join('');
+    }
+    // AI 自动生成成就
+    const autoGen = ach.autoGenerated || {};
+    const autoEntries = Object.entries(autoGen);
+    if (autoEntries.length) {
+      html += '<div style="font-size:11px;color:#8e99a4;margin:6px 0 2px;">AI 生成 (' + autoEntries.length + ')</div>';
+      html += autoEntries.slice(-10).reverse().map(function(entry) {
+        var a = entry[1];
+        return '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">'
+          + (a.icon || '✨') + ' <strong>' + u(a.title || entry[0]) + '</strong>'
+          + (a.desc ? ' — ' + u(a.desc) : '')
+          + '</div>';
+      }).join('');
+    }
+    return html;
+  }
+
+  function renderCombatBoard(s) {
+    const ct = s.combat || {};
+    if (!(ct.totalBattles > 0)) return '<div class="we-empty">暂无战斗记录</div>';
+    const total = ct.totalBattles || 0;
+    const wins = ct.wins || 0;
+    const losses = ct.losses || 0;
+    const rate = total > 0 ? (wins / total * 100).toFixed(1) : '0.0';
+    const streak = ct.currentStreak > 0 ? '连胜' + ct.currentStreak + '场' : ct.currentStreak < 0 ? '连败' + Math.abs(ct.currentStreak) + '场' : '无';
+    let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;font-size:11px;color:#c0c8d4;margin-bottom:6px;">'
+      + '<div>总战斗: <strong>' + total + '</strong>场</div>'
+      + '<div>胜率: <strong>' + rate + '%</strong></div>'
+      + '<div>击杀: <strong>' + (ct.totalKills || 0) + '</strong>人</div>'
+      + '<div>BOSS: <strong>' + (ct.bossesDefeated ? ct.bossesDefeated.length : 0) + '</strong>个</div>'
+      + '<div>伤害: 造成<strong>' + (ct.totalDamageDealt || 0) + '</strong>/承受<strong>' + (ct.totalDamageTaken || 0) + '</strong></div>'
+      + '<div>当前: ' + streak + '</div>'
+      + '<div>最佳连胜: <strong>' + (ct.bestStreak || 0) + '</strong>场</div>'
+      + '<div>风格: ' + u(ct.combatStyle || '未分类') + '</div>'
+      + '<div>常用武器: ' + u(ct.favoriteWeapon || '无') + '</div>'
+      + '</div>';
+    // 战斗日志
+    const log = ct.log || [];
+    if (log.length) {
+      html += '<details><summary style="font-size:11px;color:#58b8a9;cursor:pointer;">战斗日志 (' + log.length + ')</summary><div style="margin-top:4px;">';
+      html += log.slice(0, 15).map(function(l) {
+        var color = l.outcome === 'win' ? '#67c23a' : l.outcome === 'loss' ? '#f56c6c' : '#e6a23c';
+        return '<div style="font-size:11px;color:#a0a8b4;padding:2px 0;border-bottom:1px solid rgba(88,184,169,0.1);">'
+          + '<span style="color:' + color + ';">[' + (l.outcome === 'win' ? '胜' : l.outcome === 'loss' ? '败' : '平') + ']</span> '
+          + '第' + l.round + '轮 | ' + (l.description || '无描述')
+          + (l.weapon ? ' | 武器:' + u(l.weapon) : '')
+          + (l.isBossFight ? ' | <span style="color:#f56c6c;">BOSS:' + u(l.bossName) + '</span>' : '')
+          + '</div>';
+      }).join('');
+      html += '</div></details>';
+    }
+    return html;
+  }
+
+  function renderComboBoard(s) {
+    const combo = s.combo || 0;
+    const badge = core.getComboBadge ? core.getComboBadge(combo) : '';
+    const history = s.comboHistory || [];
+    let html = '<div style="font-size:12px;color:#c0c8d4;">当前连击: <strong style="color:#58b8a9;font-size:14px;">' + combo + '</strong> ' + badge + '</div>';
+    if (history.length) {
+      html += '<div style="font-size:11px;color:#666;margin-top:4px;">最近连击历史: ' + history.slice(-5).map(function(h) { return '第' + h.round + '轮(' + h.combo + '连)'; }).join(' → ') + '</div>';
+    }
+    return html;
+  }
+
+  function renderWorldLawsPanel(s) {
+    const wl = s.worldLaws || {};
+    let html = '<div style="font-size:11px;color:#c0c8d4;margin-bottom:4px;">'
+      + '框架: <strong>' + u(wl.frameworkName || wl.framework || '自定义') + '</strong></div>';
+    // 维度
+    const dims = wl.dimensions || {};
+    const dimEntries = Object.entries(dims);
+    if (dimEntries.length) {
+      html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:11px;color:#8e99a4;margin-bottom:4px;">';
+      dimEntries.forEach(function(entry) { html += '<div>' + u(entry[0]) + ': <strong style="color:#c0c8d4;">' + entry[1] + '</strong></div>'; });
+      html += '</div>';
+    }
+    // 自定义规则
+    const rules = wl.customRules || [];
+    if (rules.length) {
+      html += '<div style="font-size:11px;color:#8e99a4;margin-top:4px;">自定义规则:</div>';
+      rules.forEach(function(r) { html += '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">· ' + u(r) + '</div>'; });
+    }
+    // 衍生约束
+    const derived = wl.derivedConstraints || [];
+    if (derived.length) {
+      html += '<div style="font-size:11px;color:#8e99a4;margin-top:4px;">衍生约束:</div>';
+      derived.forEach(function(c) { html += '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">· ' + u(c) + '</div>'; });
+    }
+    return html;
+  }
+
+  function renderStoryTypePanel(s) {
+    const st = s.storyType || {};
+    if (!st.template) return '<div class="we-empty">未设定故事方向</div>';
+    const tpl = core.getTemplateById ? core.getTemplateById(st.template) : null;
+    const tplName = tpl ? tpl.name : st.template;
+    let html = '<div style="font-size:11px;color:#c0c8d4;">'
+      + '模板: <strong>' + u(tplName) + '</strong> | 阶段: <strong>' + (st.currentPhase || 0) + '</strong>'
+      + (tpl && tpl.phases ? '/' + tpl.phases.length : '')
+      + ' | 基调: <strong>' + u(st.tone || 'natural') + '</strong></div>';
+    if (tpl && tpl.phases && tpl.phases[st.currentPhase]) {
+      html += '<div style="font-size:11px;color:#58b8a9;margin-top:2px;">当前阶段: ' + u(tpl.phases[st.currentPhase]) + '</div>';
+    }
+    if (st.phaseProgress > 0) {
+      html += '<div style="font-size:11px;color:#8e99a4;">阶段进度: ' + (st.phaseProgress || 0) + '%</div>';
+    }
+    return html;
+  }
+
+  function renderWorldTimePanel(s) {
+    const mins = s.inWorldMinutes || 0;
+    const days = Math.floor(mins / 1440);
+    const hours = Math.floor((mins % 1440) / 60);
+    const m = mins % 60;
+    const timeStr = days > 0 ? days + '天' + hours + '时' + m + '分' : hours > 0 ? hours + '时' + m + '分' : m + '分钟';
+    let html = '<div style="font-size:12px;color:#c0c8d4;margin-bottom:4px;">⏱ 世界时间: <strong>' + timeStr + '</strong> (' + mins + '分钟)</div>';
+    const logs = s.timeLogs || [];
+    if (logs.length) {
+      html += '<details><summary style="font-size:11px;color:#58b8a9;cursor:pointer;">时间日志 (' + logs.length + ')</summary><div style="margin-top:4px;">';
+      html += logs.slice(0, 20).map(function(l) {
+        return '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">第' + l.round + '轮 +' + l.minutes + '分钟 (' + u(l.source) + ') 累计' + l.total + '分钟</div>';
+      }).join('');
+      html += '</div></details>';
+    }
+    return html;
+  }
+
+  function renderGlobalPlotBoard(s) {
+    const threads = s.globalPlotThreads || [];
+    if (!threads.length) return '<div class="we-empty">暂无全局剧情线索</div>';
+    const active = threads.filter(function(t) { return t.status === 'active' || t.status === 'frozen'; });
+    const completed = threads.filter(function(t) { return t.status === 'completed' || t.status === 'abandoned'; });
+    let html = '';
+    if (active.length) {
+      html += active.map(function(t) {
+        var typeColor = t.type === 'main' ? '#58b8a9' : t.type === 'hidden' ? '#b37feb' : '#e6a23c';
+        var statusLabel = t.status === 'frozen' ? '冻结' : '进行';
+        return '<div style="padding:4px 0;border-bottom:1px solid rgba(88,184,169,0.15);">'
+          + '<div style="font-size:11px;"><span style="color:' + typeColor + ';">[' + (t.type || 'side') + ']</span> '
+          + '<strong style="color:#c0c8d4;">' + u(t.title || '未命名') + '</strong> '
+          + '<span style="color:#666;">(' + statusLabel + ')</span></div>'
+          + '<div style="font-size:10px;color:#8e99a4;">进度: ' + (t.progress || 0) + '%' + (t.participants && t.participants.length ? ' | 参与者: ' + t.participants.join(', ') : '') + (t.relatedFactions && t.relatedFactions.length ? ' | 势力: ' + t.relatedFactions.join(', ') : '') + '</div>'
+          + (t.milestones && t.milestones.length ? '<div style="font-size:10px;color:#666;">里程碑: ' + t.milestones.slice(-3).map(function(m) { return m.event; }).join(' → ') + '</div>' : '')
+          + '</div>';
+      }).join('');
+    }
+    if (completed.length) {
+      html += '<div style="font-size:11px;color:#666;margin:6px 0 2px;">已完结 (' + completed.length + ')</div>';
+      html += completed.slice(0, 5).map(function(t) {
+        return '<div style="font-size:11px;color:#555;padding:1px 0;">✓ ' + u(t.title || '未命名') + ' (' + (t.status || '?') + ')</div>';
+      }).join('');
+    }
+    return html;
+  }
+
+  function renderEmotionMapPanel(s) {
+    const em = s.emotionMap || {};
+    const entries = Object.entries(em);
+    if (!entries.length) return '<div class="we-empty">暂无情感记录</div>';
+    return entries.map(function(entry) {
+      var name = entry[0], data = entry[1];
+      var emotion = data.emotion || data.attitude || '平静';
+      var intensity = data.intensity || 0;
+      var barWidth = Math.min(100, Math.max(5, intensity * 20));
+      var reasons = data.reasons || [];
+      return '<div style="padding:3px 0;border-bottom:1px solid rgba(88,184,169,0.1);">'
+        + '<div style="font-size:11px;"><strong style="color:#c0c8d4;">' + u(name) + '</strong>: '
+        + '<span style="color:#58b8a9;">' + u(emotion) + '</span>'
+        + ' <span style="color:#666;">(强度' + intensity + ')</span></div>'
+        + '<div style="height:3px;background:#2a2a3a;border-radius:2px;margin:2px 0;"><div style="height:100%;width:' + barWidth + '%;background:#58b8a9;border-radius:2px;"></div></div>'
+        + (reasons.length ? '<div style="font-size:10px;color:#666;">原因: ' + reasons.slice(-3).map(function(r) { return u(r); }).join(', ') + '</div>' : '')
+        + '</div>';
+    }).join('');
+  }
+
+  // ========== NPC 渲染 ==========
+
+  const NPC_STATUS_LABELS = { active: '活跃', injured: '受伤', imprisoned: '被囚', dead: '已故', retired: '退场', missing: '失踪' };
+  const NPC_STATUS_COLORS = { active: 'var(--we-teal)', injured: '#e6a23c', imprisoned: '#909399', dead: '#f56c6c', retired: '#8e8e93', missing: '#b37feb' };
+  const NPC_HEALTH_LABELS = { healthy: '健康', injured: '受伤', critical: '重伤', dead: '死亡' };
+
+  function renderNpcs(npcsList, scope) {
+    const addBtn = `<div class="we-signal-add we-npc-add" data-npc-scope="${scope}"><i class="fa-solid fa-plus"></i> 添加NPC</div>`;
+    if (!npcsList || !npcsList.length) return '<div class="we-empty">暂无NPC角色</div>' + addBtn;
+
+    // 分组：活跃 vs 非活跃
+    const active = npcsList.filter(n => n.status === 'active');
+    const inactive = npcsList.filter(n => n.status !== 'active');
+    let html = '';
+    if (active.length) {
+      html += renderPagedList(active, 'npcs-active', (npc, relIdx) => {
+        const realIdx = npcsList.indexOf(npc);
+        return renderNpcCard(npc, realIdx, scope, npcsList);
+      }, 4);
+    }
+    if (inactive.length) {
+      html += '<div class="we-npc-inactive-header" style="color:#8e8e93;font-size:11px;margin:6px 0 2px;padding-left:2px;">非活跃 (' + inactive.length + ')</div>';
+      html += renderPagedList(inactive, 'npcs-inactive', (npc, relIdx) => {
+        const realIdx = npcsList.indexOf(npc);
+        return renderNpcCard(npc, realIdx, scope, npcsList);
+      }, 4);
+    }
+    return html + addBtn;
+  }
+
+  function renderNpcCard(npc, npcIndex, scope, allNpcs) {
+    const isEditing = editingNpc?.scope === scope && editingNpc?.index === npcIndex;
+    const statusColor = NPC_STATUS_COLORS[npc.status] || 'var(--we-teal)';
+    const actionHtml = isEditing ? '' : `
+      <div class="we-event-actions">
+        <button class="we-icon-btn we-npc-delete" data-npc-scope="${scope}" data-npc-index="${npcIndex}" title="删除NPC"><i class="fa-solid fa-trash-can"></i></button>
+        <button class="we-icon-btn we-npc-edit" data-npc-scope="${scope}" data-npc-index="${npcIndex}" title="编辑NPC"><i class="fa-solid fa-pen"></i></button>
+      </div>`;
+    const editHtml = isEditing ? renderNpcEditor(npc, npcIndex, scope) : '';
+
+    const factionTag = npc.faction ? `<span class="we-badge" style="background:var(--we-purple);font-size:10px;">${u(npc.faction)}</span>` : '';
+    const roleTag = npc.role ? `<span class="we-badge" style="background:#5a6a7a;font-size:10px;">${u(npc.role)}</span>` : '';
+    const statusBadge = `<span class="we-badge" style="background:${statusColor};font-size:10px;">${NPC_STATUS_LABELS[npc.status] || npc.status}</span>`;
+    const healthBadge = npc.health && npc.health !== 'healthy' ? `<span class="we-badge" style="background:#e6a23c;font-size:10px;">${NPC_HEALTH_LABELS[npc.health] || npc.health}</span>` : '';
+
+    const portraitHtml = npc.portrait ? `<div class="we-npc-portrait" style="color:#a0a8b4;font-size:11px;font-style:italic;margin:2px 0;">${u(npc.portrait)}</div>` : '';
+    const locationHtml = npc.location ? `<div style="font-size:11px;color:#8e99a4;">位置: ${u(npc.location)}${npc.goal ? ' | 目标: ' + u(npc.goal) : ''}</div>` : (npc.goal ? `<div style="font-size:11px;color:#8e99a4;">目标: ${u(npc.goal)}</div>` : '');
+    const traitsHtml = (npc.traits || []).length ? `<div style="font-size:11px;color:#7ec8c8;">${npc.traits.map(t => u(t)).join(' · ')}</div>` : '';
+
+    // 活动日志
+    const logs = npc.activityLog || [];
+    const logsHtml = logs.length ? `<details class="we-npc-logs"><summary style="font-size:11px;color:#58b8a9;cursor:pointer;">活动日志 (${logs.length})</summary><div style="margin-top:4px;">${logs.slice().reverse().map(l =>
+      `<div style="font-size:11px;color:#a0a8b4;padding:1px 0;"><span style="color:#58b8a9;">第${l.round}轮</span> ${u(l.action)}</div>`
+    ).join('')}</div></details>` : '';
+
+    // 剧情线索
+    const threads = npc.plotThreads || [];
+    const threadsHtml = threads.length ? `<details class="we-npc-threads"><summary style="font-size:11px;color:#e6a23c;cursor:pointer;">剧情线索 (${threads.length})</summary><div style="margin-top:4px;">${threads.map(t => {
+      const tColor = t.status === 'resolved' ? '#67c23a' : t.status === 'abandoned' ? '#909399' : '#e6a23c';
+      return `<div style="font-size:11px;color:#a0a8b4;padding:1px 0;"><span style="color:${tColor};">[${t.status === 'active' ? '进行' : t.status === 'resolved' ? '已解' : '废弃'}]</span> ${u(t.thread)} <span style="color:#666;">(第${t.since}轮)</span></div>`;
+    }).join('')}</div></details>` : '';
+
+    // 死亡信息
+    const deathHtml = npc.deathInfo ? `<div style="font-size:11px;color:#f56c6c;margin-top:2px;">☠ 第${npc.deathInfo.round}轮 ${u(npc.deathInfo.cause || '死因不明')}${npc.deathInfo.impact ? ' — ' + u(npc.deathInfo.impact) : ''}</div>` : '';
+
+    // ★ 画像摘要
+    const digestHtml = npc.digest ? `<div style="font-size:11px;color:#a0a8b4;margin:2px 0;font-style:italic;">${u(npc.digest)}</div>` : '';
+
+    // ★ 基本信息（种族·性别·年龄·职业）
+    const bioParts = [];
+    if (npc.race && npc.race !== '未知') bioParts.push(npc.race);
+    if (npc.gender && npc.gender !== '未知') bioParts.push(npc.gender);
+    if (npc.age > 0) bioParts.push(npc.age + '岁');
+    if (npc.ageStage && npc.ageStage !== '成年') bioParts.push(npc.ageStage);
+    if (npc.occupation && npc.occupation !== '未知') bioParts.push(npc.occupation);
+    const bioHtml = bioParts.length ? `<div style="font-size:11px;color:#8e99a4;">${bioParts.join(' · ')}</div>` : '';
+
+    // ★ 性格标签
+    const pTags = npc.personalityTags || [];
+    const pTagsHtml = pTags.length ? `<div style="font-size:11px;color:#7ec8c8;">性格: ${pTags.map(t => u(t.tag)).join(' · ')}</div>` : '';
+
+    // ★ 关键事件
+    const keyEvents = npc.keyEvents || [];
+    const keyEventsHtml = keyEvents.length ? `<details><summary style="font-size:11px;color:#b37feb;cursor:pointer;">关键事件 (${keyEvents.length})</summary><div style="margin-top:2px;">${keyEvents.slice(-8).map(e => `<div style="font-size:11px;color:#a0a8b4;padding:1px 0;"><span style="color:#b37feb;">第${e.round}轮</span> ${u(e.event)}</div>`).join('')}</div></details>` : '';
+
+    // ★ 战斗风格
+    const cs = npc.combatStyle || {};
+    const combatStyleHtml = (cs.style && cs.style !== '未分类') ? `<div style="font-size:11px;color:#e6a23c;">战斗: ${u(cs.style)}${cs.rating ? ' (' + cs.rating + ')' : ''}${cs.preferredWeapon ? ' | 武器: ' + u(cs.preferredWeapon) : ''}</div>` : '';
+
+    // ★ 统计数据
+    const stats = npc.stats || {};
+    const statsParts = [];
+    if (stats.kills > 0) statsParts.push('击杀' + stats.kills);
+    if (stats.questsCompleted > 0) statsParts.push('任务' + stats.questsCompleted);
+    if (stats.conversationsWithPlayer > 0) statsParts.push('对话' + stats.conversationsWithPlayer);
+    const statsHtml = statsParts.length ? `<div style="font-size:10px;color:#666;">统计: ${statsParts.join(' | ')}</div>` : '';
+
+    return `<div class="we-blood-item we-npc-card">
+      ${actionHtml}
+      <div class="we-blood-title">${npc.icon || '👤'} ${u(npc.name)} ${statusBadge}${healthBadge}${factionTag}${roleTag}</div>
+      ${portraitHtml}
+      ${digestHtml}
+      ${bioHtml}
+      ${traitsHtml}
+      ${pTagsHtml}
+      ${locationHtml}
+      ${combatStyleHtml}
+      ${statsHtml}
+      ${deathHtml}
+      ${logsHtml}
+      ${threadsHtml}
+      ${keyEventsHtml}
+      ${editHtml}
+    </div>`;
+  }
+
+  function renderNpcEditor(npc, index, scope) {
+    const statusOptions = ['active','injured','imprisoned','dead','retired','missing'].map(v =>
+      `<option value="${v}" ${npc.status === v ? 'selected' : ''}>${NPC_STATUS_LABELS[v] || v}</option>`).join('');
+    const healthOptions = ['healthy','injured','critical','dead'].map(v =>
+      `<option value="${v}" ${npc.health === v ? 'selected' : ''}>${NPC_HEALTH_LABELS[v] || v}</option>`).join('');
+    return `
+      <div class="we-event-editor" data-npc-scope="${scope}" data-npc-index="${index}">
+        <button class="we-event-editor-close we-npc-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label>名称<input class="we-npc-edit-name" type="text" value="${u(npc.name || '')}"></label>
+          <label>定位<input class="we-npc-edit-role" type="text" value="${u(npc.role || '')}"></label>
+          <label>势力<input class="we-npc-edit-faction" type="text" value="${u(npc.faction || '')}"></label>
+          <label>位置<input class="we-npc-edit-location" type="text" value="${u(npc.location || '')}"></label>
+          <label>状态<select class="we-npc-edit-status">${statusOptions}</select></label>
+          <label>健康<select class="we-npc-edit-health">${healthOptions}</select></label>
+          <label class="we-event-editor-wide">性格标签<input class="we-npc-edit-traits" type="text" value="${u((npc.traits || []).join(', '))}" placeholder="逗号分隔，如: 狡诈, 重义"></label>
+          <label class="we-event-editor-wide">能力标签<input class="we-npc-edit-abilities" type="text" value="${u((npc.abilities || []).join(', '))}" placeholder="逗号分隔"></label>
+          <label class="we-event-editor-wide">当前目标<input class="we-npc-edit-goal" type="text" value="${u(npc.goal || '')}"></label>
+          <label class="we-event-editor-wide">画像描述<textarea class="we-npc-edit-portrait" rows="2">${u(npc.portrait || '')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-npc-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderInfluenceChain(chain, scope) {
+    if (!chain || !chain.length) return '<div class="we-empty">暂无影响链</div>';
+    return renderPagedList(chain, 'influence', (item, infIndex) => {
+      const isEditing = editingInfluence?.scope === scope && editingInfluence?.index === infIndex;
+      const actionHtml = isEditing ? '' : `
+        <div class="we-event-actions">
+          <button class="we-icon-btn we-influence-delete" data-influence-scope="${scope}" data-influence-index="${infIndex}" title="删除影响链"><i class="fa-solid fa-trash-can"></i></button>
+          <button class="we-icon-btn we-influence-copy" data-influence-scope="${scope}" data-influence-index="${infIndex}" title="复制影响链"><i class="fa-solid fa-copy"></i></button>
+          <button class="we-icon-btn we-influence-edit" data-influence-scope="${scope}" data-influence-index="${infIndex}" title="编辑影响链"><i class="fa-solid fa-pen"></i></button>
+        </div>`;
+      const editHtml = isEditing ? renderInfluenceEditor(item, infIndex, scope) : '';
+      return `<div class="we-influence-item">
+        ${actionHtml}
+        <div class="we-influence-step we-influence-trigger">
+          <span class="we-influence-label">触发源</span>
+          <span class="we-influence-text">${u(item.trigger)}</span>
+        </div>
+        <div class="we-influence-step we-influence-impact">
+          <span class="we-influence-label">直接影响</span>
+          <span class="we-influence-text">${u(item.impact)}</span>
+        </div>
+        ${item.fallout ? `<div class="we-influence-step we-influence-fallout">
+          <span class="we-influence-label">后续余波</span>
+          <span class="we-influence-text">${u(item.fallout)}</span>
+        </div>` : ''}
+        ${editHtml}
+      </div>`;
+    });
+  }
+
+  function renderInfluenceEditor(item, index, scope) {
+    return `
+      <div class="we-event-editor" data-influence-index="${index}" data-influence-scope="${scope}">
+        <button class="we-event-editor-close we-influence-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label class="we-event-editor-wide">触发源<textarea class="we-influence-edit-trigger" rows="2">${u(item.trigger||'')}</textarea></label>
+          <label class="we-event-editor-wide">直接影响<textarea class="we-influence-edit-impact" rows="2">${u(item.impact||'')}</textarea></label>
+          <label class="we-event-editor-wide">后续余波<textarea class="we-influence-edit-fallout" rows="2">${u(item.fallout||'')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-influence-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function getRegionalIncidentTypeLabel(type) {
+    const labels = {
+      banditry: '盗匪劫掠',
+      fire: '大火',
+      massacre: '恶性凶案',
+      flood: '洪涝',
+      infrastructure: '道路水利崩坏',
+      plague: '疫病',
+      famine: '饥荒粮荒',
+      riot: '骚乱暴动',
+      rebellion: '民变叛乱',
+      military: '军务突变',
+      earthquake: '地震山崩',
+      storm: '风暴雪灾',
+      other: '其他'
+    };
+    return labels[type] || '其他';
+  }
+
+  function renderRegionalIncident(ri, scope) {
+    if (!ri) return '<div class="we-empty">尚未进行区域事件判定</div>';
+    const isEditing = editingRI?.active === true && editingRI?.scope === scope;
+    const actionHtml = isEditing ? '' : `
+      <div class="we-event-actions">
+        <button class="we-icon-btn we-ri-delete" data-ri-scope="${scope}" title="清除区域事件"><i class="fa-solid fa-trash-can"></i></button>
+        <button class="we-icon-btn we-ri-copy" data-ri-scope="${scope}" title="复制区域事件"><i class="fa-solid fa-copy"></i></button>
+        <button class="we-icon-btn we-ri-edit" data-ri-scope="${scope}" title="编辑区域事件"><i class="fa-solid fa-pen"></i></button>
+      </div>`;
+    const editHtml = isEditing ? renderRIEditor(ri, scope) : '';
+
+    if (ri.active) {
+      return `<div class="we-accident-item we-regional-incident-item we-accident-triggered">
+        ${actionHtml}
+        ${u(ri.title)}<br>
+        <span style="font-size:11px;color:var(--we-text3);">类型: ${u(getRegionalIncidentTypeLabel(ri.type))} | 范围: ${u(ri.scope||'?')} | 剩余: ${ri.duration||0}轮</span><br>
+        <span style="font-size:11px;color:var(--we-text2);">${u(ri.impact||'')}</span>
+        ${editHtml}
+      </div>`;
+    }
+    if (ri.title && ri.title.includes('重试')) {
+      return `<div class="we-accident-item we-regional-incident-item" style="border-left:3px solid var(--we-gold);">
+        ${actionHtml}
+        ${u(ri.title)}（类型: ${u(getRegionalIncidentTypeLabel(ri.type))}）
+        ${editHtml}
+      </div>`;
+    }
+    if (ri.cooldown > 0) {
+      return `<div class="we-accident-item we-regional-incident-item">${actionHtml}本轮无区域事件（剩余冷却 ${ri.cooldown} 轮）${editHtml}</div>`;
+    }
+    return `<div class="we-accident-item we-regional-incident-item">${actionHtml}本轮无区域事件${editHtml}</div>`;
+  }
+
+  function renderRIEditor(ri, scope) {
+    const types = ['banditry','fire','massacre','flood','infrastructure','plague','famine','riot','rebellion','military','earthquake','storm'];
+    if (ri.type && !types.includes(ri.type)) types.push(ri.type);
+    const typeOptions = types.map(t =>
+      `<option value="${t}" ${ri.type === t ? 'selected' : ''}>${u(getRegionalIncidentTypeLabel(t))}</option>`).join('');
+    return `
+      <div class="we-event-editor" data-ri-edit="1" data-ri-scope="${scope}">
+        <button class="we-event-editor-close we-ri-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">
+          <label>状态<select class="we-ri-edit-active">
+            <option value="true" ${ri.active ? 'selected' : ''}>激活并显示事件</option>
+            <option value="false" ${!ri.active ? 'selected' : ''}>未激活</option>
+          </select></label>
+          <label class="we-event-editor-wide">标题<input class="we-ri-edit-title" type="text" value="${u(ri.title||'')}"></label>
+          <label>类型<select class="we-ri-edit-type">${typeOptions}</select></label>
+          <label>范围<input class="we-ri-edit-scope" type="text" value="${u(ri.scope||'')}"></label>
+          <label>剩余轮数<input class="we-ri-edit-duration" type="number" min="0" max="99" value="${ri.duration||0}"></label>
+          <label>冷却<input class="we-ri-edit-cooldown" type="number" min="0" max="99" value="${ri.cooldown||0}"></label>
+          <label class="we-event-editor-wide">影响<textarea class="we-ri-edit-impact" rows="3">${u(ri.impact||'')}</textarea></label>
+        </div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-ri-editor-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  const SECRET_STATUS_COLOR = { '有效': 'var(--we-green)', '过期': 'var(--we-text3)', '暴露': 'var(--we-red)', '失效': 'var(--we-text3)' };
+
+  function isEditingSecret(scope, list, index) {
+    return editingSecret && editingSecret.scope === scope && editingSecret.list === list && editingSecret.index === index;
+  }
+
+  function renderBlackbox(blackbox, scope) {
+    if (!blackbox) return '<div class="we-empty">暂无黑盒信息</div>';
+    let html = '';
+    const actions = blackbox.secretActions || [];
+    const assets = blackbox.secretAssets || [];
+
+    if (actions.length) {
+      html += '<div class="we-secret-group-label we-secret-action">隐秘行为</div>';
+      html += renderPagedList(actions, 'secret-actions', (raw, idx) => {
+        const a = (typeof raw === 'string') ? { action: raw } : raw;
+        if (isEditingSecret(scope, 'action', idx)) return renderSecretEditor(a, 'action', idx, scope);
+        return `<div class="we-secret-card we-secret-action">
+          <div class="we-secret-ops">
+            <button class="we-icon-btn we-secret-edit" data-secret-scope="${scope}" data-secret-list="action" data-secret-index="${idx}" title="编辑"><i class="fa-solid fa-pen"></i></button>
+            <button class="we-icon-btn we-secret-copy" data-secret-scope="${scope}" data-secret-list="action" data-secret-index="${idx}" title="复制"><i class="fa-solid fa-copy"></i></button>
+            <button class="we-icon-btn we-secret-del" data-secret-scope="${scope}" data-secret-list="action" data-secret-index="${idx}" title="删除"><i class="fa-solid fa-trash-can"></i></button>
+          </div>
+          <div class="we-secret-body">
+            <div class="we-secret-title">${u(a.action || '未命名行为')}</div>
+            <div class="we-secret-meta">知情者 · ${u(a.witnesses || '无')}</div>
+          </div>
+        </div>`;
+      });
+    }
+
+    if (assets.length) {
+      html += '<div class="we-secret-group-label we-secret-asset">隐秘资产</div>';
+      html += renderPagedList(assets, 'secret-assets', (raw, idx) => {
+        const a = (typeof raw === 'string') ? { name: raw } : raw;
+        if (isEditingSecret(scope, 'asset', idx)) return renderSecretEditor(a, 'asset', idx, scope);
+        const expo = Math.min(100, Math.max(0, Number(a.exposure) || 0));
+        const status = a.status || '有效';
+        const stColor = SECRET_STATUS_COLOR[status] || 'var(--we-text3)';
+        return `<div class="we-secret-card we-secret-asset">
+          <div class="we-secret-ops">
+            <button class="we-icon-btn we-secret-edit" data-secret-scope="${scope}" data-secret-list="asset" data-secret-index="${idx}" title="编辑"><i class="fa-solid fa-pen"></i></button>
+            <button class="we-icon-btn we-secret-copy" data-secret-scope="${scope}" data-secret-list="asset" data-secret-index="${idx}" title="复制"><i class="fa-solid fa-copy"></i></button>
+            <button class="we-icon-btn we-secret-del" data-secret-scope="${scope}" data-secret-list="asset" data-secret-index="${idx}" title="删除"><i class="fa-solid fa-trash-can"></i></button>
+          </div>
+          <div class="we-secret-body">
+            <div class="we-secret-title">${u(a.name || '未命名资产')}<span class="we-secret-status" style="color:${stColor};border-color:${stColor};">${u(status)}</span></div>
+            <div class="we-secret-expo">
+              <div class="we-secret-expo-track"><div class="we-secret-expo-fill" style="width:${expo}%;"></div></div>
+              <span class="we-secret-expo-num">暴露 ${expo}%</span>
+            </div>
+          </div>
+        </div>`;
+      });
+    }
+
+    if (!html) html = '<div class="we-empty">无暗面信息</div>';
+    return html;
+  }
+
+  /** 秘密统一编辑器：顶部「类型」下拉只切表单(view)，转换延到保存才落库 */
+  function renderSecretEditor(a, list, index, scope, view) {
+    view = view || (editingSecret && editingSecret.view) || list;
+    const typeSelect = `<label>类型<select class="we-secret-type">
+        <option value="action" ${view === 'action' ? 'selected' : ''}>隐秘行为</option>
+        <option value="asset" ${view === 'asset' ? 'selected' : ''}>隐秘资产</option>
+      </select></label>`;
+    // 跨类型预填：行为↔资产 标题字段互通（action.action ↔ asset.name）
+    const titleText = u(a.action || a.name || '');
+    let fields;
+    if (view === 'action') {
+      fields = `${typeSelect}
+        <label class="we-event-editor-wide">行为描述<textarea class="we-secret-f-action" rows="2">${titleText}</textarea></label>
+        <label class="we-event-editor-wide">目击者<input class="we-secret-f-witnesses" type="text" value="${u(a.witnesses || '无')}"></label>`;
+    } else {
+      const statusOptions = ['有效','过期','暴露','失效'].map(s =>
+        `<option value="${s}" ${a.status === s ? 'selected' : ''}>${s}</option>`).join('');
+      fields = `${typeSelect}
+        <label class="we-event-editor-wide">资产名称<input class="we-secret-f-name" type="text" value="${titleText}"></label>
+        <label>暴露度<input class="we-secret-f-exposure" type="number" min="0" max="100" value="${Number(a.exposure) || 0}"></label>
+        <label>状态<select class="we-secret-f-status">${statusOptions}</select></label>`;
+    }
+    return `
+      <div class="we-event-editor we-secret-editor" data-secret-scope="${scope}" data-secret-list="${list}" data-secret-index="${index}" data-secret-view="${view}">
+        <button class="we-event-editor-close we-secret-editor-close"><i class="fa-solid fa-xmark"></i></button>
+        <div class="we-event-editor-grid">${fields}</div>
+        <div class="we-event-editor-footer">
+          <button class="we-btn we-btn-primary we-secret-save"><i class="fa-solid fa-floppy-disk"></i> 保存</button>
+        </div>
+      </div>`;
+  }
+
+  function renderLedger(memories) {
+    const entries = (memories || []).filter(m => m.type === 'ledger').reverse();
+    if (!entries.length) return '<div class="we-empty">暂无重大事件记录</div>';
+    return renderPagedList(entries, 'ledger', entry => {
+      const lines = [];
+      for (const c of (entry.changes || [])) {
+        if (c.type === 'event_new') {
+          const tn = { conflict: '冲突型', progress: '推进型' }[c.eventType] || c.eventType;
+          lines.push(`[新增Lv${c.level}${tn}] ${u(c.name)} - ${u(c.stage)} - ${u(c.desc||'')}`);
+        } else if (c.type === 'event_advance') {
+          lines.push(`[推进] ${u(c.name)}(Lv${c.level}) ${u(c.fromStage)}->${u(c.toStage)} - ${u(c.desc||'')}`);
+        } else if (c.type === 'event_terminal') {
+          const transition = c.fromStage ? `${u(c.fromStage)}->${u(c.stage||c.toStage)}` : u(c.stage||c.toStage);
+          lines.push(`[终局] ${u(c.name)}(Lv${c.level}) ${transition} - ${u(c.desc||'')}`);
+        } else if (c.type === 'wind_new') {
+          lines.push(`[新增Lv${c.level}风声] ${u(c.topic)} - ${u(c.content||'')}`);
+        }
+      }
+      return `<div class="we-ledger-item">
+        <span class="we-ledger-round">第${entry.round}轮</span>
+        <div class="we-ledger-changes">${lines.map(l => `<div class="we-ledger-line">${l}</div>`).join('')}</div>
+      </div>`;
+    });
+  }
+
+  function renderDebug() {
+    const evo = window.WORLD_ENGINE_EVOLUTION;
+    if (!evo || !evo.getLastDebug) return '<div class="we-empty">调试数据不可用</div>';
+    const dbg = evo.getLastDebug();
+    if (!dbg.prompt) return '<div class="we-empty">尚未推演，暂无调试数据</div>';
+    const truncPrompt = dbg.prompt.length > 3000 ? dbg.prompt.substring(0, 3000) + '\n\n...(截断，点击下方按钮导出完整文件)' : dbg.prompt;
+    const truncResult = dbg.rawResult.length > 3000 ? dbg.rawResult.substring(0, 3000) + '\n\n...(截断，点击下方按钮导出完整文件)' : dbg.rawResult;
+    return `
+      <div style="margin-bottom:8px;">
+        <div style="font-size:12px;color:var(--we-text2);margin-bottom:4px;">发送给 API 的 Prompt（前3000字预览）</div>
+        <pre style="font-size:11px;background:var(--we-bg2);padding:6px;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;">${u(truncPrompt)}</pre>
+      </div>
+      <div>
+        <div style="font-size:12px;color:var(--we-text2);margin-bottom:4px;">API 原始返回（前3000字预览）</div>
+        <pre style="font-size:11px;background:var(--we-bg2);padding:6px;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;">${u(truncResult)}</pre>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <button class="we-btn" id="we-export-prompt" style="flex:1;">导出 Prompt</button>
+        <button class="we-btn" id="we-export-raw-result" style="flex:1;">导出 API 返回</button>
+      </div>
+    `;
+  }
+
+  function renderSettingsForm() {
+    const settings = window.WORLD_ENGINE_API
+      ? window.WORLD_ENGINE_API.getSettings(true)
+      : JSON.parse(window.WORLD_ENGINE_STORE.getItem('world_engine_settings') || '{}');
+    const mode = (settings.evolveMode === 'manual' || settings.evolveMode === 'time') ? settings.evolveMode : 'auto';
+    const everyX = Math.max(1, parseInt(settings.evolveEveryX) || 1);
+    const readRounds = Math.min(everyX, Math.max(1, parseInt(settings.evolveReadRounds) || 1));
+    // 按时间模式的当前值
+    const _stForTime = core.hasState() ? core.loadState() : null;
+    const _cpForTime = core.restoreCheckpoint();
+    const stTimeVal = (_stForTime && _stForTime.time != null) ? _stForTime.time : '';
+    const cpTimeVal = (_cpForTime && _cpForTime.time != null) ? _cpForTime.time : '';
+    const lastDayVal = (core.getLastStoryDay && core.getLastStoryDay() != null) ? core.getLastStoryDay() : '';
+    const tv = (k, d) => (settings[k] != null && settings[k] !== '') ? settings[k] : d;
+
+    const sec = (id, title, body) =>
+      '<div class="we-section"><div class="we-section-title">' + sectionHeader(title, id) + '</div>' +
+      sectionBody(id, body) + '</div>';
+
+    const apiBody = `
+      <div class="we-input-group">
+        <label>API URL（OpenAI 兼容）</label>
+        <input type="text" id="we-api-url" value="${u(settings.apiUrl||'')}" placeholder="https://api.openai.com/v1">
+      </div>
+      <div class="we-input-group">
+        <label>API Key</label>
+        <input type="password" id="we-api-key" value="${u(settings.apiKey||'')}">
+      </div>
+      <div class="we-input-group" style="display:flex;gap:6px;align-items:end;">
+        <div style="flex:1;">
+          <label>模型</label>
+          <input type="text" id="we-model" value="${u(settings.model||'gpt-3.5-turbo')}" placeholder="模型名称" style="width:100%;">
+        </div>
+        <button class="we-btn" id="we-fetch-models" style="white-space:nowrap;flex-shrink:0;">获取列表</button>
+      </div>
+      <div class="we-input-group">
+        <select id="we-model-list" style="display:none;width:100%;margin-top:4px;">
+          <option value="">-- 选择模型 --</option>
+        </select>
+      </div>`;
+
+    const evolveBody = `
+      <div class="we-input-group">
+        <label>推演模式</label>
+        <select id="we-evolve-mode" style="width:100%;">
+          <option value="auto" ${mode === 'auto' ? 'selected' : ''}>自动 · 按轮（每 X 轮推演一次）</option>
+          <option value="time" ${mode === 'time' ? 'selected' : ''}>自动 · 按时间（正文日期差够 N 天）</option>
+          <option value="manual" ${mode === 'manual' ? 'selected' : ''}>手动（仅点「手动推演」才触发）</option>
+        </select>
+      </div>
+      <div class="we-input-group" id="we-evolve-everyx-group" style="${mode === 'auto' ? '' : 'display:none;'}">
+        <label>每几轮推演一次（X）</label>
+        <input type="number" id="we-evolve-everyx" min="1" step="1" value="${everyX}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">填 1 = 每轮推演；填 3 = 每向前 3 轮推演一次。重 roll 不计入轮数。</div>
+      </div>
+      <div class="we-input-group" id="we-evolve-readrounds-group" style="${mode === 'auto' ? '' : 'display:none;'}">
+        <label>每次推演读取最近几轮对话（a）</label>
+        <input type="number" id="we-evolve-readrounds" min="1" max="${everyX}" step="1" value="${readRounds}" style="width:100%;">
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">从当前层往前取 a 轮的「用户输入 + AI 输出」喂给后台推演。最小 1，最大不超过 X（每次推演的轮数）。默认 1 = 只读最新一轮。</div>
+      </div>
+      <div id="we-evolve-time-group" style="${mode === 'time' ? '' : 'display:none;'}">
+        <div class="we-input-group" style="display:flex;gap:6px;">
+          <div style="flex:1;"><label>取正文前 N 字</label><input type="number" id="we-time-front" min="0" step="1" value="${tv('evolveTimeFront', 0)}" style="width:100%;"></div>
+          <div style="flex:1;"><label>取正文后 N 字</label><input type="number" id="we-time-back" min="0" step="1" value="${tv('evolveTimeBack', 80)}" style="width:100%;"></div>
+        </div>
+        <div class="we-input-group">
+          <label>日期正则（6 框：1/3/5 抓数字 → 捕获组，2/4/6 单位）</label>
+          <div style="display:flex;gap:4px;flex-wrap:wrap;">
+            <input type="text" id="we-time-re1" value="${u(tv('evolveTimeRe1',''))}" placeholder="框1 如 \\d+ 或 [一二三...]+" style="flex:1 1 30%;">
+            <input type="text" id="we-time-re2" value="${u(tv('evolveTimeRe2',''))}" placeholder="框2 单位 如 年" style="flex:1 1 18%;">
+            <input type="text" id="we-time-re3" value="${u(tv('evolveTimeRe3',''))}" placeholder="框3" style="flex:1 1 30%;">
+            <input type="text" id="we-time-re4" value="${u(tv('evolveTimeRe4',''))}" placeholder="框4 如 月" style="flex:1 1 18%;">
+            <input type="text" id="we-time-re5" value="${u(tv('evolveTimeRe5',''))}" placeholder="框5" style="flex:1 1 30%;">
+            <input type="text" id="we-time-re6" value="${u(tv('evolveTimeRe6',''))}" placeholder="框6 如 日/号" style="flex:1 1 18%;">
+          </div>
+          <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">某框留空即跳过。中文数字自动换算，多个日期取最后一个。</div>
+        </div>
+        <div class="we-input-group" style="display:flex;gap:6px;">
+          <div style="flex:1;"><label>乘数A（框1）</label><input type="number" id="we-time-mul1" step="any" value="${tv('evolveTimeMul1',360)}" style="width:100%;"></div>
+          <div style="flex:1;"><label>乘数B（框3）</label><input type="number" id="we-time-mul2" step="any" value="${tv('evolveTimeMul2',30)}" style="width:100%;"></div>
+          <div style="flex:1;"><label>乘数C（框5）</label><input type="number" id="we-time-mul3" step="any" value="${tv('evolveTimeMul3',1)}" style="width:100%;"></div>
+        </div>
+        <div class="we-input-group">
+          <label>满 N 天推演一次</label>
+          <input type="number" id="we-time-threshold" min="1" step="1" value="${tv('evolveTimeThreshold',1)}" style="width:100%;">
+        </div>
+        <div class="we-input-group">
+          <label>最多读取最近 X 轮对话</label>
+          <input type="number" id="we-time-maxrounds" min="1" step="1" value="${tv('evolveTimeMaxRounds',10)}" style="width:100%;">
+          <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">自上次推演以来跨了几轮就读几轮，超过 X 则只读最近 X 轮，封顶防止 prompt 过长。</div>
+        </div>
+        <div class="we-input-group" style="border-top:1px solid var(--we-border,#3a3a3a);padding-top:8px;">
+          <label>当前状态时间（总天数）</label>
+          <input type="number" id="we-time-state" step="any" value="${stTimeVal}" placeholder="state.time，空则不写" style="width:100%;">
+        </div>
+        <div class="we-input-group">
+          <label>存档点时间（总天数）</label>
+          <input type="number" id="we-time-checkpoint" step="any" value="${cpTimeVal}" placeholder="checkpoint.time，空则不写" style="width:100%;">
+        </div>
+        <div class="we-input-group">
+          <label>本轮对话时间（总天数）</label>
+          <input type="number" id="we-time-current" step="any" value="${lastDayVal}" placeholder="保存即判断是否推演" style="width:100%;">
+          <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">保存后：与基准时间相减，够 N 天则立即推演。三个时间框都只在有值时写入，写错可关闭插件重开重填。</div>
+        </div>
+      </div>`;
+
+    const filterBody = `
+      <div class="we-input-group">
+        <label>每行一条正则，匹配内容会在喂后台前删除</label>
+        <textarea id="we-filter-regex" rows="4" style="width:100%;resize:vertical;" placeholder="例如 &lt;think&gt;[\\s\\S]*?&lt;/think&gt;">${u(tv('evolveFilterRegex',''))}</textarea>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">对每条「用户/AI」文本逐行做 g 全局替换为空，再拼装喂后台推演。不影响聊天正文，也不影响日期抓取。</div>
+      </div>`;
+
+    const injectBody = `
+      <div class="we-input-group">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="we-inject-into-prompt" ${settings.injectIntoPrompt !== false ? 'checked' : ''}>
+          注入正文
+        </label>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">关闭后不会将当前状态或存档点注入聊天正文。</div>
+      </div>`;
+
+    const displayMode = settings.displayMode === 'expand' ? 'expand' : 'mask';
+    const displayBody = `
+      <div class="we-input-group">
+        <label>主页显示模式</label>
+        <select id="we-display-mode" style="width:100%;">
+          <option value="mask" ${displayMode === 'mask' ? 'selected' : ''}>遮蔽模式（主页 + 分页进入）</option>
+          <option value="expand" ${displayMode === 'expand' ? 'selected' : ''}>展开模式（所有内容平铺）</option>
+        </select>
+        <div style="font-size:11px;color:var(--we-text3);margin-top:3px;">展开模式下世界摘要下方直接平铺全部 section，无需进分页。</div>
+      </div>`;
+
+    return sec('set-api', 'API 配置', apiBody)
+      + sec('set-evolve', '推演模式', evolveBody)
+      + sec('set-filter', '输入输出过滤器', filterBody)
+      + sec('set-display', '界面显示', displayBody)
+      + sec('set-inject', '正文注入', injectBody);
+  }
+
+  function renderSettingsAfterCheckpoint() {
+    const sec = (id, title, body) =>
+      '<div class="we-section"><div class="we-section-title">' + sectionHeader(title, id) + '</div>' +
+      sectionBody(id, body) + '</div>';
+    const worldbookBody = `
+      <div class="we-worldbook-settings">
+        <div class="we-worldbook-header">
+          <div><div class="we-worldbook-summary" id="we-worldbook-summary">正在读取当前聊天世界书...</div></div>
+          <button class="we-icon-btn" id="we-worldbook-reload" title="重新读取当前聊天世界书"><i class="fa-solid fa-rotate"></i></button>
+        </div>
+        <div class="we-worldbook-toolbar">
+          <button class="we-btn" id="we-worldbook-select-all">全选</button>
+          <button class="we-btn" id="we-worldbook-clear-all">取消全选</button>
+          <button class="we-btn we-btn-primary" id="we-worldbook-save">保存世界书选择</button>
+        </div>
+        <div class="we-worldbook-list" id="we-worldbook-list"><div class="we-empty">正在读取...</div></div>
+      </div>`;
+    const dataBody = `
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="we-btn" id="we-export-data">导出 JSON</button>
+        <button class="we-btn" id="we-import-data">导入 JSON</button>
+        <input type="file" id="we-import-file" accept=".json" style="display:none;">
+      </div>`;
+    const toneBody = `
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="we-btn" id="we-tone-import">导入</button>
+        <button class="we-btn" id="we-tone-export">导出</button>
+        <button class="we-btn" id="we-tone-clear">清除</button>
+        <input type="file" id="we-tone-file" accept=".txt" style="display:none;">
+      </div>
+      <div class="we-hint" id="we-tone-status" style="margin-top:6px;"></div>`;
+    return sec('set-worldbook', '后台推演世界书', worldbookBody)
+      + sec('set-data', '数据导入/导出', dataBody)
+      + sec('set-tone', '附加提示词', toneBody);
+  }
+
+  function bindEvents(state) {
+    document.querySelectorAll('.we-event-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.eventScope;
+        const index = Number(button.dataset.eventIndex);
+        const scopedState = loadScopedState(scope);
+        const event = scopedState?.events?.[index];
+        if (!event || !confirm(`删除事件“${event.name}”？`)) return;
+        scopedState.events.splice(index, 1);
+        editingEvent = null;
+        saveScopedState(scope, scopedState);
+        showToast('事件已删除');
+        refresh();
+      };
+    });
+
+    document.querySelectorAll('.we-event-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.eventScope;
+        const index = Number(button.dataset.eventIndex);
+        const scopedState = loadScopedState(scope);
+        const event = scopedState?.events?.[index];
+        if (!event) return;
+        const copy = JSON.parse(JSON.stringify(event));
+        delete copy.evolveResult;
+        core.ensureEventFields(copy);
+        scopedState.events.push(copy);
+        saveScopedState(scope, scopedState);
+        showToast('事件已复制到列表末尾');
+        refresh();
+      };
+    });
+
+    document.querySelectorAll('.we-event-edit').forEach(button => {
+      button.onclick = () => {
+        editingEvent = {
+          scope: button.dataset.eventScope,
+          index: Number(button.dataset.eventIndex)
+        };
+        refresh();
+      };
+    });
+
+    document.querySelectorAll('.we-event-editor-close').forEach(button => {
+      button.onclick = () => {
+        editingEvent = null;
+        refresh();
+      };
+    });
+
+    document.querySelectorAll('.we-event-edit-type').forEach(select => {
+      select.onchange = () => {
+        const stageSelect = select.closest('.we-event-editor').querySelector('.we-event-edit-stage');
+        const stages = select.value === 'progress'
+          ? ['筹备', '执行', '关键', '已完成', '已失败']
+          : ['萌芽', '发酵', '逼近', '已爆发', '已消散'];
+        stageSelect.innerHTML = stages.map(stage => `<option value="${stage}">${stage}</option>`).join('');
+      };
+    });
+
+    document.querySelectorAll('.we-event-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.eventScope;
+        const index = Number(editor.dataset.eventIndex);
+        const scopedState = loadScopedState(scope);
+        const event = scopedState?.events?.[index];
+        if (!event) return;
+
+        const name = editor.querySelector('.we-event-edit-name').value.trim();
+        if (!name) {
+          showToast('事件名字不能为空', true);
+          return;
+        }
+        event.name = name;
+        event.level = Number(editor.querySelector('.we-event-edit-level').value);
+        event.type = editor.querySelector('.we-event-edit-type').value;
+        event.stage = editor.querySelector('.we-event-edit-stage').value;
+        event.stageRound = Math.min(9, Math.max(1, Number(editor.querySelector('.we-event-edit-round').value) || 1));
+        event.desc = editor.querySelector('.we-event-edit-desc').value.trim();
+        event.consecutiveFails = 0;
+        delete event.evolveResult;
+
+        // 剩余轮数 → 反推 _terminalSince（仅正面终局）
+        const POSITIVE_TERMINALS = ['已爆发', '已完成'];
+        if (POSITIVE_TERMINALS.includes(event.stage)) {
+          const K = 2 + (event.level || 1) * 2;
+          const curRound = scopedState.round || 0;
+          let left = Number(editor.querySelector('.we-event-edit-left').value);
+          left = Number.isFinite(left) && left >= 1 ? Math.min(K, left) : K;
+          event._terminalSince = curRound - K + left - 1;
+        } else {
+          delete event._terminalSince;
+        }
+        core.ensureEventFields(event);
+        saveScopedState(scope, scopedState);
+        editingEvent = null;
+        showToast('事件修改已保存');
+        refresh();
+      };
+    });
+
+    // 势力编辑器事件
+    document.querySelectorAll('.we-faction-edit').forEach(button => {
+      button.onclick = () => {
+        editingFaction = { scope: button.dataset.factionScope, index: Number(button.dataset.factionIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-faction-editor-close').forEach(button => {
+      button.onclick = () => { editingFaction = null; refresh(); };
+    });
+    document.querySelectorAll('.we-faction-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.factionScope;
+        const index = Number(editor.dataset.factionIndex);
+        const state = loadScopedState(scope);
+        const faction = state.factions?.[index];
+        if (!faction) return;
+        const name = editor.querySelector('.we-faction-edit-name').value.trim();
+        if (!name) { showToast('势力名称不能为空', true); return; }
+        faction.name = name;
+        faction.status = editor.querySelector('.we-faction-edit-status').value;
+        faction.relation = editor.querySelector('.we-faction-edit-relation').value;
+        faction.scope = editor.querySelector('.we-faction-edit-scope').value.trim();
+        faction.currentGoal = editor.querySelector('.we-faction-edit-goal').value.trim();
+        faction.core_person = editor.querySelector('.we-faction-edit-core').value.trim();
+        const pillars = [];
+        editor.querySelectorAll('.we-faction-edit-pillar').forEach(input => {
+          const v = input.value.trim().slice(0, 4);
+          if (v) pillars.push(v);
+        });
+        faction.powerPillars = pillars;
+        saveScopedState(scope, state);
+        editingFaction = null;
+        showToast('势力修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-faction-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.factionScope;
+        const index = Number(button.dataset.factionIndex);
+        const state = loadScopedState(scope);
+        const faction = state.factions?.[index];
+        if (!faction || !confirm(`删除势力"${faction.name}"？`)) return;
+        state.factions.splice(index, 1);
+        saveScopedState(scope, state);
+        showToast('势力已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-faction-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.factionScope;
+        const index = Number(button.dataset.factionIndex);
+        const state = loadScopedState(scope);
+        const faction = state.factions?.[index];
+        if (!faction) return;
+        const copy = JSON.parse(JSON.stringify(faction));
+        state.factions.splice(index + 1, 0, copy);
+        saveScopedState(scope, state);
+        showToast('势力已复制');
+        refresh();
+      };
+    });
+
+    // 风声编辑器事件
+    document.querySelectorAll('.we-wind-edit').forEach(button => {
+      button.onclick = () => {
+        editingWind = { scope: button.dataset.windScope, index: Number(button.dataset.windIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-wind-editor-close').forEach(button => {
+      button.onclick = () => { editingWind = null; refresh(); };
+    });
+    document.querySelectorAll('.we-wind-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.windScope;
+        const index = Number(editor.dataset.windIndex);
+        const scopedState = loadScopedState(scope);
+        const wind = scopedState.winds?.[index];
+        if (!wind) return;
+        const topic = editor.querySelector('.we-wind-edit-topic').value.trim();
+        if (!topic) { showToast('风声主题不能为空', true); return; }
+        wind.topic = topic;
+        wind.type = editor.querySelector('.we-wind-edit-type').value;
+        wind.level = Number(editor.querySelector('.we-wind-edit-level').value);
+        wind.scope = editor.querySelector('.we-wind-edit-scope').value.trim();
+        wind.source = editor.querySelector('.we-wind-edit-source').value.trim();
+        wind.content = editor.querySelector('.we-wind-edit-content').value.trim();
+        wind.quietRounds = 0;
+        saveScopedState(scope, scopedState);
+        editingWind = null;
+        showToast('风声修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-wind-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.windScope;
+        const index = Number(button.dataset.windIndex);
+        const scopedState = loadScopedState(scope);
+        const wind = scopedState.winds?.[index];
+        if (!wind || !confirm(`删除风声"${wind.topic}"？`)) return;
+        scopedState.winds.splice(index, 1);
+        saveScopedState(scope, scopedState);
+        showToast('风声已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-wind-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.windScope;
+        const index = Number(button.dataset.windIndex);
+        const scopedState = loadScopedState(scope);
+        const wind = scopedState.winds?.[index];
+        if (!wind) return;
+        const copy = JSON.parse(JSON.stringify(wind));
+        copy.quietRounds = 0;
+        scopedState.winds.push(copy);
+        saveScopedState(scope, scopedState);
+        showToast('风声已复制');
+        refresh();
+      };
+    });
+
+    // ===== 天下大势编辑器事件 =====
+    document.querySelectorAll('.we-trend-edit').forEach(button => {
+      button.onclick = () => {
+        editingTrend = { scope: button.dataset.trendScope, index: Number(button.dataset.trendIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-trend-editor-close').forEach(button => {
+      button.onclick = () => { editingTrend = null; refresh(); };
+    });
+    document.querySelectorAll('.we-trend-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.trendScope;
+        const index = Number(editor.dataset.trendIndex);
+        const scopedState = loadScopedState(scope);
+        const trend = scopedState?.worldTrends?.[index];
+        if (!trend) return;
+        const name = editor.querySelector('.we-trend-edit-name').value.trim();
+        if (!name) { showToast('大势名称不能为空', true); return; }
+        trend.name = name;
+        trend.status = editor.querySelector('.we-trend-edit-status').value;
+        trend.scope = editor.querySelector('.we-trend-edit-scope').value.trim();
+        trend.source = editor.querySelector('.we-trend-edit-source').value.trim();
+        trend.description = editor.querySelector('.we-trend-edit-desc').value.trim();
+        saveScopedState(scope, scopedState);
+        editingTrend = null;
+        showToast('天下大势修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-trend-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.trendScope;
+        const index = Number(button.dataset.trendIndex);
+        const scopedState = loadScopedState(scope);
+        const trend = scopedState?.worldTrends?.[index];
+        if (!trend || !confirm(`删除大势"${trend.name}"？`)) return;
+        scopedState.worldTrends.splice(index, 1);
+        saveScopedState(scope, scopedState);
+        showToast('天下大势已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-trend-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.trendScope;
+        const index = Number(button.dataset.trendIndex);
+        const scopedState = loadScopedState(scope);
+        const trend = scopedState?.worldTrends?.[index];
+        if (!trend) return;
+        const copy = JSON.parse(JSON.stringify(trend));
+        scopedState.worldTrends.push(copy);
+        saveScopedState(scope, scopedState);
+        showToast('天下大势已复制');
+        refresh();
+      };
+    });
+
+    // ===== 仇敌编辑器事件 =====
+    document.querySelectorAll('.we-enemy-edit').forEach(button => {
+      button.onclick = () => {
+        editingEnemy = { scope: button.dataset.enemyScope, index: Number(button.dataset.enemyIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-enemy-editor-close').forEach(button => {
+      button.onclick = () => { editingEnemy = null; refresh(); };
+    });
+    document.querySelectorAll('.we-enemy-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.enemyScope;
+        const index = Number(editor.dataset.enemyIndex);
+        const state = loadScopedState(scope);
+        const enemy = state.enemies?.[index];
+        if (!enemy) return;
+        const name = editor.querySelector('.we-enemy-edit-name').value.trim();
+        if (!name) { showToast('仇敌名称不能为空', true); return; }
+        enemy.name = name;
+        enemy.type = editor.querySelector('.we-enemy-edit-type').value;
+        enemy.status = editor.querySelector('.we-enemy-edit-status').value;
+        enemy.reason = editor.querySelector('.we-enemy-edit-reason').value.trim();
+        saveScopedState(scope, state);
+        editingEnemy = null;
+        showToast('仇敌修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-enemy-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.enemyScope;
+        const index = Number(button.dataset.enemyIndex);
+        const state = loadScopedState(scope);
+        const enemy = state.enemies?.[index];
+        if (!enemy || !confirm(`删除仇敌"${enemy.name}"？`)) return;
+        state.enemies.splice(index, 1);
+        saveScopedState(scope, state);
+        showToast('仇敌已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-enemy-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.enemyScope;
+        const index = Number(button.dataset.enemyIndex);
+        const state = loadScopedState(scope);
+        const enemy = state.enemies?.[index];
+        if (!enemy) return;
+        const copy = JSON.parse(JSON.stringify(enemy));
+        state.enemies.splice(index + 1, 0, copy);
+        saveScopedState(scope, state);
+        showToast('仇敌已复制');
+        refresh();
+      };
+    });
+
+    // ===== NPC 编辑器事件 =====
+    document.querySelectorAll('.we-npc-add').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.npcScope;
+        const state = loadScopedState(scope);
+        if (!state.npcs) state.npcs = [];
+        const newNpc = { name: '新NPC', role: '', faction: '', status: 'active', traits: [], abilities: [], location: '', goal: '', health: 'healthy', firstSeen: state.round || 0, lastActive: state.round || 0, activityLog: [], plotThreads: [], relations: [], portrait: '', deathInfo: null };
+        state.npcs.unshift(newNpc);
+        saveScopedState(scope, state);
+        editingNpc = { scope, index: 0 };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-npc-edit').forEach(button => {
+      button.onclick = () => {
+        editingNpc = { scope: button.dataset.npcScope, index: Number(button.dataset.npcIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-npc-editor-close').forEach(button => {
+      button.onclick = () => { editingNpc = null; refresh(); };
+    });
+    document.querySelectorAll('.we-npc-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.npcScope;
+        const index = Number(editor.dataset.npcIndex);
+        const state = loadScopedState(scope);
+        const npc = state.npcs?.[index];
+        if (!npc) return;
+        const name = editor.querySelector('.we-npc-edit-name').value.trim();
+        if (!name) { showToast('NPC名称不能为空', true); return; }
+        npc.name = name;
+        npc.role = editor.querySelector('.we-npc-edit-role').value.trim();
+        npc.faction = editor.querySelector('.we-npc-edit-faction').value.trim();
+        npc.location = editor.querySelector('.we-npc-edit-location').value.trim();
+        npc.status = editor.querySelector('.we-npc-edit-status').value;
+        npc.health = editor.querySelector('.we-npc-edit-health').value;
+        npc.traits = editor.querySelector('.we-npc-edit-traits').value.split(/[,，]/).map(s => s.trim()).filter(Boolean).slice(0, 4);
+        npc.abilities = editor.querySelector('.we-npc-edit-abilities').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+        npc.goal = editor.querySelector('.we-npc-edit-goal').value.trim();
+        npc.portrait = editor.querySelector('.we-npc-edit-portrait').value.trim();
+        if (npc.status === 'dead') {
+          npc.health = 'dead';
+          if (!npc.deathInfo) npc.deathInfo = { round: state.round || 0, cause: '未知', impact: '' };
+        }
+        npc.lastActive = state.round || 0;
+        saveScopedState(scope, state);
+        editingNpc = null;
+        showToast('NPC修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-npc-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.npcScope;
+        const index = Number(button.dataset.npcIndex);
+        const state = loadScopedState(scope);
+        const npc = state.npcs?.[index];
+        if (!npc || !confirm(`删除NPC“${npc.name}”？`)) return;
+        state.npcs.splice(index, 1);
+        saveScopedState(scope, state);
+        showToast('NPC已删除');
+        refresh();
+      };
+    });
+
+    // ===== 影响链编辑器事件 =====
+    document.querySelectorAll('.we-influence-edit').forEach(button => {
+      button.onclick = () => {
+        editingInfluence = { scope: button.dataset.influenceScope, index: Number(button.dataset.influenceIndex) };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-influence-editor-close').forEach(button => {
+      button.onclick = () => { editingInfluence = null; refresh(); };
+    });
+    document.querySelectorAll('.we-influence-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.influenceScope;
+        const index = Number(editor.dataset.influenceIndex);
+        const scopedState = loadScopedState(scope);
+        const inf = scopedState.influenceChain?.[index];
+        if (!inf) return;
+        const trigger = editor.querySelector('.we-influence-edit-trigger').value.trim();
+        const impact = editor.querySelector('.we-influence-edit-impact').value.trim();
+        if (!trigger || !impact) { showToast('触发源和直接影响不能为空', true); return; }
+        inf.trigger = trigger;
+        inf.impact = impact;
+        inf.fallout = editor.querySelector('.we-influence-edit-fallout').value.trim();
+        saveScopedState(scope, scopedState);
+        editingInfluence = null;
+        showToast('影响链修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-influence-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.influenceScope;
+        const index = Number(button.dataset.influenceIndex);
+        const scopedState = loadScopedState(scope);
+        const inf = scopedState.influenceChain?.[index];
+        if (!inf || !confirm(`删除影响链"${inf.trigger}"？`)) return;
+        scopedState.influenceChain.splice(index, 1);
+        saveScopedState(scope, scopedState);
+        showToast('影响链已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-influence-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.influenceScope;
+        const index = Number(button.dataset.influenceIndex);
+        const scopedState = loadScopedState(scope);
+        const inf = scopedState.influenceChain?.[index];
+        if (!inf) return;
+        const copy = JSON.parse(JSON.stringify(inf));
+        copy._createdRound = Number(scopedState.round) || 0;
+        scopedState.influenceChain.push(copy);
+        saveScopedState(scope, scopedState);
+        showToast('影响链已复制');
+        refresh();
+      };
+    });
+
+    // ===== 区域事件编辑器事件 =====
+    document.querySelectorAll('.we-ri-edit').forEach(button => {
+      button.onclick = () => {
+        editingRI = { active: true, scope: button.dataset.riScope };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-ri-editor-close').forEach(button => {
+      button.onclick = () => { editingRI = null; refresh(); };
+    });
+    document.querySelectorAll('.we-ri-editor-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-event-editor');
+        const scope = editor.dataset.riScope;
+        const state = loadScopedState(scope);
+        if (!state.regionalIncident) {
+          state.regionalIncident = { active: false, title: '', type: '', scope: '', impact: '', duration: 0, cooldown: 0, _retry: false, _retryType: '' };
+        }
+        const ri = state.regionalIncident;
+        ri.active = editor.querySelector('.we-ri-edit-active').value === 'true';
+        ri.title = editor.querySelector('.we-ri-edit-title').value.trim();
+        ri.type = editor.querySelector('.we-ri-edit-type').value;
+        ri.scope = editor.querySelector('.we-ri-edit-scope').value.trim();
+        ri.duration = Math.max(0, Number(editor.querySelector('.we-ri-edit-duration').value) || 0);
+        ri.cooldown = Math.max(0, Number(editor.querySelector('.we-ri-edit-cooldown').value) || 0);
+        ri.impact = editor.querySelector('.we-ri-edit-impact').value.trim();
+        saveScopedState(scope, state);
+        editingRI = null;
+        showToast('区域事件修改已保存');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-ri-delete').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.riScope;
+        const state = loadScopedState(scope);
+        if (!state.regionalIncident) return;
+        if (!confirm('清除区域事件？')) return;
+        state.regionalIncident = { active: false, title: '', type: '', scope: '', impact: '', cooldown: state.regionalIncident.cooldown || 0, _retry: false, _retryType: '' };
+        saveScopedState(scope, state);
+        showToast('区域事件已清除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-ri-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.riScope;
+        const state = loadScopedState(scope);
+        if (!state.regionalIncident) return;
+        const copy = JSON.parse(JSON.stringify(state.regionalIncident));
+        copy._retry = false;
+        copy._retryType = '';
+        copy.cooldown = 0;
+        state.regionalIncident = copy;
+        saveScopedState(scope, state);
+        showToast('区域事件已复制（冷却已重置）');
+        refresh();
+      };
+    });
+
+    // ===== 秘密（隐秘行为/资产）统一编辑器事件 =====
+    const SECRET_ARR = { action: 'secretActions', asset: 'secretAssets' };
+
+    document.querySelectorAll('.we-secret-edit').forEach(button => {
+      button.onclick = () => {
+        const list = button.dataset.secretList;
+        editingSecret = { scope: button.dataset.secretScope, list, index: Number(button.dataset.secretIndex), view: list };
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-secret-editor-close').forEach(button => {
+      button.onclick = () => { editingSecret = null; refresh(); };
+    });
+    // 类型下拉：仅切换显示的表单(view)，不动数据、不保存
+    document.querySelectorAll('.we-secret-type').forEach(select => {
+      select.onchange = () => {
+        if (editingSecret) { editingSecret.view = select.value; refresh(); }
+      };
+    });
+    document.querySelectorAll('.we-secret-save').forEach(button => {
+      button.onclick = () => {
+        const editor = button.closest('.we-secret-editor');
+        const scope = editor.dataset.secretScope;
+        const list = editor.dataset.secretList;            // 条目当前所在桶
+        const index = Number(editor.dataset.secretIndex);
+        const view = editor.dataset.secretView;            // 目标类型（可能与 list 不同）
+        const state = loadScopedState(scope);
+        state.blackbox = state.blackbox || {};
+        const srcArr = state.blackbox[SECRET_ARR[list]];
+        if (!srcArr || srcArr[index] === undefined) return;
+
+        // 按 view 读取表单，组装目标条目
+        let item, okMsg;
+        if (view === 'action') {
+          const action = editor.querySelector('.we-secret-f-action').value.trim();
+          if (!action) { showToast('行为描述不能为空', true); return; }
+          item = { action, witnesses: editor.querySelector('.we-secret-f-witnesses').value.trim() || '无' };
+        } else {
+          const name = editor.querySelector('.we-secret-f-name').value.trim();
+          if (!name) { showToast('资产名称不能为空', true); return; }
+          item = {
+            name,
+            exposure: Math.min(100, Math.max(0, Number(editor.querySelector('.we-secret-f-exposure').value) || 0)),
+            status: editor.querySelector('.we-secret-f-status').value
+          };
+        }
+
+        if (view === list) {
+          srcArr[index] = item;                            // 原地更新
+          okMsg = view === 'action' ? '隐秘行为已保存' : '隐秘资产已保存';
+        } else {
+          srcArr.splice(index, 1);                         // 从旧桶移除
+          const arrKey = SECRET_ARR[view];
+          if (!Array.isArray(state.blackbox[arrKey])) state.blackbox[arrKey] = [];
+          state.blackbox[arrKey].push(item);               // 落入新桶 = 真正的类型转换
+          okMsg = view === 'action' ? '已转为隐秘行为' : '已转为隐秘资产';
+        }
+        saveScopedState(scope, state);
+        editingSecret = null;
+        showToast(okMsg);
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-secret-del').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.secretScope;
+        const list = button.dataset.secretList;
+        const index = Number(button.dataset.secretIndex);
+        const state = loadScopedState(scope);
+        const arr = state.blackbox?.[SECRET_ARR[list]];
+        if (!arr || arr[index] === undefined) return;
+        if (!confirm(list === 'action' ? '删除隐秘行为？' : '删除隐秘资产？')) return;
+        arr.splice(index, 1);
+        saveScopedState(scope, state);
+        showToast('已删除');
+        refresh();
+      };
+    });
+    document.querySelectorAll('.we-secret-copy').forEach(button => {
+      button.onclick = () => {
+        const scope = button.dataset.secretScope;
+        const list = button.dataset.secretList;
+        const index = Number(button.dataset.secretIndex);
+        const state = loadScopedState(scope);
+        const arr = state.blackbox?.[SECRET_ARR[list]];
+        if (!arr || arr[index] === undefined) return;
+        arr.splice(index + 1, 0, JSON.parse(JSON.stringify(arr[index])));  // 就近插入
+        saveScopedState(scope, state);
+        showToast('已复制');
+        refresh();
+      };
+    });
+
+    // ===== 导航事件 =====
+    const backBtn = document.getElementById('we-btn-back');
+    if (backBtn) backBtn.onclick = () => { _currentView = 'home'; refresh(); };
+
+    const settingsOpenBtn = document.getElementById('we-btn-settings-open');
+    if (settingsOpenBtn) settingsOpenBtn.onclick = () => { _currentView = 'settings'; refresh(); };
+
+    document.querySelectorAll('.we-nav-row[data-view]').forEach(row => {
+      row.onclick = () => {
+        if (_selectedNavView === row.dataset.view) {
+          // 二次点击：进入分页
+          _selectedNavView = null;
+          _currentView = row.dataset.view;
+          refresh();
+        } else {
+          // 首次点击：选中该行
+          _selectedNavView = row.dataset.view;
+          refresh();
+        }
+      };
+    });
+
+    // 点击导航列表以外的地方取消选中
+    const panelBody = panelBodyElement;
+    if (panelBody) {
+      panelBody.onclick = (e) => {
+        if (_currentView === 'home' && _selectedNavView && !e.target.closest('.we-nav-row')) {
+          _selectedNavView = null;
+          refresh();
+        }
+      };
+    }
+
+    // ===== 区块折叠/展开事件 =====
+    document.querySelectorAll('.we-section-toggle').forEach(toggle => {
+      toggle.onclick = () => {
+        const sectionId = toggle.dataset.section;
+        sectionCollapsed[sectionId] = !sectionCollapsed[sectionId];
+        const body = document.getElementById('we-section-body-' + sectionId);
+        const arrow = document.getElementById('we-section-arrow-' + sectionId);
+        if (body) body.style.display = sectionCollapsed[sectionId] ? 'none' : '';
+        if (arrow) arrow.textContent = sectionCollapsed[sectionId] ? '▶' : '▼';
+      };
+    });
+
+    const refreshBtn = document.getElementById('we-btn-refresh');
+    if (refreshBtn) refreshBtn.onclick = () => refresh();
+
+    const saveBtn = document.getElementById('we-save-settings');
+    if (saveBtn) {
+      saveBtn.onclick = () => {
+        const _modeRaw = document.getElementById('we-evolve-mode')?.value;
+        const gv = id => document.getElementById(id)?.value;
+        const ns = {
+          ...(window.WORLD_ENGINE_API ? window.WORLD_ENGINE_API.getSettings(true) : {}),
+          apiUrl: document.getElementById('we-api-url')?.value || '',
+          apiKey: document.getElementById('we-api-key')?.value || '',
+          model: document.getElementById('we-model')?.value || 'gpt-3.5-turbo',
+          injectIntoPrompt: document.getElementById('we-inject-into-prompt')?.checked !== false,
+          evolveMode: (_modeRaw === 'manual' || _modeRaw === 'time') ? _modeRaw : 'auto',
+          evolveEveryX: Math.max(1, parseInt(document.getElementById('we-evolve-everyx')?.value) || 1),
+          evolveReadRounds: Math.max(1, parseInt(document.getElementById('we-evolve-readrounds')?.value) || 1),
+          evolveFilterRegex: gv('we-filter-regex') || '',
+          displayMode: document.getElementById('we-display-mode')?.value === 'expand' ? 'expand' : 'mask',
+          // 按时间模式
+          evolveTimeFront: Math.max(0, parseInt(gv('we-time-front')) || 0),
+          evolveTimeBack: Math.max(0, parseInt(gv('we-time-back')) || 0),
+          evolveTimeRe1: gv('we-time-re1') || '', evolveTimeRe2: gv('we-time-re2') || '',
+          evolveTimeRe3: gv('we-time-re3') || '', evolveTimeRe4: gv('we-time-re4') || '',
+          evolveTimeRe5: gv('we-time-re5') || '', evolveTimeRe6: gv('we-time-re6') || '',
+          evolveTimeMul1: parseFloat(gv('we-time-mul1')) || 0,
+          evolveTimeMul2: parseFloat(gv('we-time-mul2')) || 0,
+          evolveTimeMul3: parseFloat(gv('we-time-mul3')) || 0,
+          evolveTimeThreshold: Math.max(1, parseInt(gv('we-time-threshold')) || 1),
+          evolveTimeMaxRounds: Math.max(1, parseInt(gv('we-time-maxrounds')) || 10)
+        };
+        // a 不得超过 X（每次推演的轮数）
+        ns.evolveReadRounds = Math.min(ns.evolveReadRounds, ns.evolveEveryX);
+        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify(ns));
+        if (window.WORLD_ENGINE_API) window.WORLD_ENGINE_API.getSettings(true);
+
+        // 按时间模式：三个时间框「有值才写」，本轮对话时间写入后触发判断
+        if (ns.evolveMode === 'time') {
+          const stIn = gv('we-time-state');
+          if (stIn != null && stIn !== '') {
+            const s2 = core.loadState();
+            if (s2) { s2.time = Number(stIn); core.saveState(s2); }
+          }
+          const cpIn = gv('we-time-checkpoint');
+          if (cpIn != null && cpIn !== '') {
+            const cp2 = core.restoreCheckpoint();
+            if (cp2) { cp2.time = Number(cpIn); core.saveCheckpoint(cp2); }
+          }
+          const curIn = gv('we-time-current');
+          if (curIn != null && curIn !== '') {
+            window.WORLD_ENGINE?.manualTimeEvolve?.(Number(curIn));
+          }
+        }
+
+        window.WORLD_ENGINE?.applyInjection?.();
+        showToast('设置已保存');
+      };
+    }
+
+    // 推演模式切换：按轮显示 X/a，按时间显示时间组，手动都隐藏
+    const evolveModeSel = document.getElementById('we-evolve-mode');
+    if (evolveModeSel) {
+      evolveModeSel.onchange = () => {
+        const v = evolveModeSel.value;
+        const roundShow = v === 'auto' ? '' : 'none';
+        const timeShow = v === 'time' ? '' : 'none';
+        const g1 = document.getElementById('we-evolve-everyx-group');
+        if (g1) g1.style.display = roundShow;
+        const g2 = document.getElementById('we-evolve-readrounds-group');
+        if (g2) g2.style.display = roundShow;
+        const g3 = document.getElementById('we-evolve-time-group');
+        if (g3) g3.style.display = timeShow;
+      };
+    }
+
+    const worldbookList = document.getElementById('we-worldbook-list');
+    if (worldbookList) {
+      const worldbook = window.WORLD_ENGINE_WORLDBOOK;
+      const summary = document.getElementById('we-worldbook-summary');
+      const reloadBtn = document.getElementById('we-worldbook-reload');
+      const selectAllBtn = document.getElementById('we-worldbook-select-all');
+      const clearAllBtn = document.getElementById('we-worldbook-clear-all');
+      const saveWorldbookBtn = document.getElementById('we-worldbook-save');
+
+      function updateWorldbookSummary() {
+        const checkboxes = [...worldbookList.querySelectorAll('.we-worldbook-entry-check')];
+        const selected = checkboxes.filter(checkbox => checkbox.checked);
+        const chars = selected.reduce((total, checkbox) => total + Number(checkbox.dataset.chars || 0), 0);
+        if (summary) summary.textContent = `${selected.length}/${checkboxes.length} 条已选，约 ${chars} 字符`;
+      }
+
+      async function loadWorldbookEntries() {
+        if (!worldbook) {
+          worldbookList.innerHTML = '<div class="we-empty">世界书模块未加载</div>';
+          return;
+        }
+        worldbookList.innerHTML = '<div class="we-empty">正在读取当前聊天世界书...</div>';
+        if (reloadBtn) reloadBtn.disabled = true;
+        try {
+          const entries = await worldbook.loadCurrentEntries();
+          const currentChatId = worldbook.getChatId ? worldbook.getChatId() : (window.WORLD_ENGINE_CORE?.getChatId?.() || 'default');
+          // 用 hasSelection() 区分"从未保存"与"保存了空数组"，避免刷新后误触发自动全选
+          const isFirstVisit = worldbook.hasSelection ? !worldbook.hasSelection() : false;
+          const savedIds = worldbook.getSelectedIds();
+          _wbCachedEntries = entries;
+          _wbCachedChatId = currentChatId;
+          // 首次进入该聊天（存储中无记录）则自动全选启用条目
+          if (isFirstVisit && entries.length) {
+            const allIds = entries.filter(e => !e.disabled).map(e => e.id);
+            worldbook.saveSelectedIds(allIds);
+            _wbCachedSelectedIds = new Set(allIds);
+            showToast(`已自动全选 ${allIds.length} 条世界书条目`);
+          } else {
+            const enabledIds = new Set(entries.filter(e => !e.disabled).map(e => e.id));
+            const validSavedIds = savedIds.filter(id => enabledIds.has(id));
+            _wbCachedSelectedIds = new Set(validSavedIds);
+            // 仅在有匹配条目时才回写，防止刷新后 entry.world 尚未加载导致 ID 全部不匹配、
+            // 误将保存记录清空为 []（清空后下次开面板会误触发自动全选）
+            if (validSavedIds.length > 0 && validSavedIds.length !== savedIds.length) {
+              worldbook.saveSelectedIds(validSavedIds);
+            }
+          }
+          renderWorldbookList();
+        } catch(error) {
+          worldbookList.innerHTML = `<div class="we-empty">读取失败：${u(error.message)}</div>`;
+          if (summary) summary.textContent = '读取失败';
+          _wbCachedEntries = null;
+          _wbCachedSelectedIds = null;
+          _wbCachedChatId = null;
+        } finally {
+          if (reloadBtn) reloadBtn.disabled = false;
+        }
+      }
+
+      function renderWorldbookList() {
+        const entries = _wbCachedEntries;
+        const selectedIds = _wbCachedSelectedIds || new Set();
+        if (!entries || !entries.length) {
+          worldbookList.innerHTML = '<div class="we-empty">当前聊天未关联可读取的世界书条目</div>';
+          if (summary) summary.textContent = '0 条可选';
+          return;
+        }
+        const groups = new Map();
+        for (const entry of entries) {
+          if (!groups.has(entry.world)) groups.set(entry.world, []);
+          groups.get(entry.world).push(entry);
+        }
+        worldbookList.innerHTML = [...groups.entries()].map(([world, worldEntries]) => {
+          const expanded = expandedWorldbookGroups.has(world);
+          return `
+          <div class="we-worldbook-group" data-worldbook-group="${u(world)}">
+            <div class="we-worldbook-group-header">
+              <span>${expanded ? '▼' : '▶'}</span>
+              <div class="we-worldbook-group-title">
+                <div>${u(world)} <span>${worldEntries.length}条</span></div>
+              </div>
+              <div class="we-worldbook-group-actions">
+                <button type="button" data-worldbook-group-action="select">全选</button>
+                <button type="button" data-worldbook-group-action="clear">取消全选</button>
+              </div>
+            </div>
+            <div class="we-worldbook-group-body" style="${expanded ? '' : 'display:none;'}">
+            ${worldEntries.map(entry => `
+              <label class="we-worldbook-entry${entry.disabled ? ' is-disabled' : ''}">
+                <input class="we-worldbook-entry-check" type="checkbox" value="${u(entry.id)}" data-chars="${entry.content.length}" ${selectedIds.has(entry.id) && !entry.disabled ? 'checked' : ''} ${entry.disabled ? 'disabled' : ''}>
+                <span>
+                  <strong>${u(entry.title)}</strong>
+                  <small>${entry.content.length} 字符${entry.disabled ? ' · 世界书内已停用' : ''}</small>
+                </span>
+              </label>`).join('')}
+            </div>
+          </div>`;
+        }).join('');
+          worldbookList.querySelectorAll('.we-worldbook-entry-check').forEach(checkbox => {
+            checkbox.onchange = () => {
+              _wbCachedSelectedIds = new Set([...worldbookList.querySelectorAll('.we-worldbook-entry-check:checked')].map(cb => cb.value));
+              updateWorldbookSummary();
+            };
+          });
+          worldbookList.querySelectorAll('.we-worldbook-group-header').forEach(header => {
+            header.onclick = () => {
+              const body = header.nextElementSibling;
+              const arrow = header.querySelector('span');
+              if (body) {
+                const isHidden = body.style.display === 'none';
+                body.style.display = isHidden ? '' : 'none';
+                if (arrow) arrow.textContent = isHidden ? '▼' : '▶';
+                const world = header.closest('.we-worldbook-group')?.dataset.worldbookGroup;
+                if (world) {
+                  if (isHidden) expandedWorldbookGroups.add(world);
+                  else expandedWorldbookGroups.delete(world);
+                }
+              }
+            };
+          });
+          worldbookList.querySelectorAll('[data-worldbook-group-action]').forEach(button => {
+            button.onclick = (e) => {
+              e.stopPropagation();
+              const group = button.closest('.we-worldbook-group');
+              if (!group) return;
+              const checked = button.dataset.worldbookGroupAction === 'select';
+              group.querySelectorAll('.we-worldbook-entry-check:not(:disabled)').forEach(checkbox => {
+                checkbox.checked = checked;
+                checkbox.onchange();
+              });
+            };
+          });
+          updateWorldbookSummary();
+          // 恢复滚动位置（refresh() 重建 DOM 后补回）
+          if (_wbScrollTop) worldbookList.scrollTop = _wbScrollTop;
+      }
+
+      if (reloadBtn) reloadBtn.onclick = () => { _wbCachedEntries = null; _wbCachedChatId = null; loadWorldbookEntries(); };
+      if (selectAllBtn) selectAllBtn.onclick = () => {
+        worldbookList.querySelectorAll('.we-worldbook-entry-check:not(:disabled)').forEach(checkbox => {
+          checkbox.checked = true;
+          checkbox.onchange();
+        });
+      };
+      if (clearAllBtn) clearAllBtn.onclick = () => {
+        worldbookList.querySelectorAll('.we-worldbook-entry-check').forEach(checkbox => {
+          checkbox.checked = false;
+          checkbox.onchange();
+        });
+      };
+      if (saveWorldbookBtn) saveWorldbookBtn.onclick = () => {
+        worldbook.saveSelectedIds([..._wbCachedSelectedIds]);
+        showToast(`已保存 ${_wbCachedSelectedIds.size} 条后台世界书条目`);
+        updateWorldbookSummary();
+      };
+      // refresh() 重建 DOM 时，如果 chatId 未变且已有缓存，直接渲染，避免勾选丢失
+      const currentChatIdNow = worldbook.getChatId ? worldbook.getChatId() : (window.WORLD_ENGINE_CORE?.getChatId?.() || 'default');
+      if (_wbCachedEntries && _wbCachedChatId === currentChatIdNow) {
+        renderWorldbookList();
+      } else {
+        loadWorldbookEntries();
+      }
+    }
+
+    const resetBtn = document.getElementById('we-reset-world');
+    if (resetBtn) {
+      resetBtn.onclick = () => {
+        if (confirm('重置当前聊天所有世界状态和记忆？不可恢复！')) {
+          core.clearState();
+          core.clearCheckpoint();
+          core.saveFingerprint(String(core.getChatLayer()));
+          showToast('世界已重置');
+          refresh();
+        }
+      };
+    }
+
+    const settingsToggle = document.querySelector('.we-settings-toggle');
+    if (settingsToggle) {
+      settingsToggle.onclick = () => {
+        const body = document.getElementById('we-settings-body');
+        const arrow = settingsToggle.querySelector('.we-toggle-arrow');
+        if (body) {
+          const isHidden = body.style.display === 'none';
+          body.style.display = isHidden ? 'block' : 'none';
+          if (arrow) arrow.textContent = isHidden ? '▼' : '▶';
+        }
+      };
+    }
+
+    const debugToggle = document.querySelector('.we-debug-toggle');
+    if (debugToggle) {
+      debugToggle.onclick = () => {
+        const body = document.getElementById('we-debug-body');
+        const arrow = debugToggle.querySelector('.we-toggle-arrow');
+        if (body) {
+          const isHidden = body.style.display === 'none';
+          body.style.display = isHidden ? 'block' : 'none';
+          if (arrow) arrow.textContent = isHidden ? '▼' : '▶';
+          if (!isHidden) refresh();
+        }
+      };
+    }
+
+    const fetchBtn = document.getElementById('we-fetch-models');
+    if (fetchBtn) {
+      fetchBtn.onclick = async () => {
+        const api = window.WORLD_ENGINE_API;
+        if (!api) { showToast('API 模块未加载', true); return; }
+        window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({
+          ...(api.getSettings ? api.getSettings(true) : {}),
+          apiUrl: document.getElementById('we-api-url')?.value || '',
+          apiKey: document.getElementById('we-api-key')?.value || '',
+          model: document.getElementById('we-model')?.value || '',
+          injectIntoPrompt: document.getElementById('we-inject-into-prompt')?.checked !== false
+        }));
+        if (api.getSettings) api.getSettings(true);
+        fetchBtn.disabled = true;
+        fetchBtn.textContent = '获取中...';
+        try {
+          const models = await api.fetchModelList();
+          const select = document.getElementById('we-model-list');
+          if (select) {
+            select.innerHTML = '<option value="">-- 选择模型 --</option>' +
+              models.map(m => '<option value="' + u(m) + '">' + u(m) + '</option>').join('');
+            select.style.display = 'block';
+            select.onchange = () => {
+              const modelInput = document.getElementById('we-model');
+              if (modelInput) modelInput.value = select.value;
+            };
+          }
+          showToast('获取到 ' + models.length + ' 个模型');
+        } catch(e) {
+          showToast('' + e.message, true);
+        }
+        fetchBtn.disabled = false;
+        fetchBtn.innerHTML = '获取列表';
+      };
+    }
+
+    const exportBtn = document.getElementById('we-export-data');
+    if (exportBtn) {
+      exportBtn.onclick = () => {
+        const s = core.loadState();
+        const checkpoint = core.restoreCheckpoint();
+        const clean = core.getCleanExport(s);
+        const cleanCheckpoint = checkpoint ? core.getCleanExport(checkpoint) : null;
+        const exportData = {
+          version: '1.2',
+          exportedAt: new Date().toISOString(),
+          chatId: core.getChatId(),
+          state: clean,
+          checkpoint: cleanCheckpoint,
+          fingerprint: core.loadFingerprint()
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'world-engine-' + core.getChatId() + '-' + Date.now() + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('已导出');
+      };
+    }
+
+    const importBtn = document.getElementById('we-import-data');
+    const importFile = document.getElementById('we-import-file');
+    if (importBtn && importFile) {
+      importBtn.onclick = () => importFile.click();
+      importFile.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            const data = JSON.parse(ev.target.result);
+            const isRegionalIncident = data && typeof data === 'object' &&
+              Object.prototype.hasOwnProperty.call(data, 'active') &&
+              Object.prototype.hasOwnProperty.call(data, 'title') &&
+              Object.prototype.hasOwnProperty.call(data, 'impact');
+            if (isRegionalIncident) {
+              const state = core.loadState();
+              state.regionalIncident = {
+                active: data.active === true || data.active === 'true',
+                title: String(data.title || ''),
+                type: String(data.type || 'other'),
+                scope: String(data.scope || ''),
+                impact: String(data.impact || ''),
+                cooldown: Math.max(0, Number(data.cooldown) || 0),
+                _retry: data._retry === true || data._retry === 'true',
+                _retryType: String(data._retryType || '')
+              };
+              core.saveState(state);
+              showToast('区域事件导入成功');
+              refresh();
+              return;
+            }
+            if (data.version !== '1.2') { showToast('不支持的存档格式版本', true); return; }
+            if (!data.state) { showToast('无效的导入文件', true); return; }
+            const s = data.state;
+            if (s.round === undefined) { showToast('缺少 round 字段', true); return; }
+            core.importState(s);
+            if (Object.prototype.hasOwnProperty.call(data, 'checkpoint')) {
+              if (data.checkpoint) {
+                data.checkpoint.chatLayer = core.getChatLayer();
+                core.saveCheckpoint(data.checkpoint);
+              }
+              else core.clearCheckpoint();
+            }
+            core.saveFingerprint(String(core.getChatLayer()));
+            showToast('导入成功！第' + s.round + '轮，' + (s.memories||[]).filter(m=>m.type==='ledger').length + '轮账本');
+            refresh();
+          } catch(err) {
+            showToast('解析失败: ' + err.message, true);
+          }
+        };
+        reader.readAsText(file);
+        importFile.value = '';
+      };
+    }
+
+    // ===== 附加提示词 导入 / 导出 / 清除 =====
+    function getTonePrompt() {
+      return (window.WORLD_ENGINE_API?.getSettings(true)?.tonePrompt || '');
+    }
+    function saveTonePrompt(text) {
+      const wapi = window.WORLD_ENGINE_API;
+      const cur = wapi && wapi.getSettings ? wapi.getSettings(true) : {};
+      window.WORLD_ENGINE_STORE.setItem('world_engine_settings', JSON.stringify({ ...cur, tonePrompt: text }));
+      if (wapi && wapi.getSettings) wapi.getSettings(true);
+    }
+    function updateToneStatus() {
+      const el = document.getElementById('we-tone-status');
+      if (!el) return;
+      const t = getTonePrompt().trim();
+      el.textContent = t ? `当前已设置附加提示词（${t.length} 字）` : '当前未设置附加提示词';
+    }
+    updateToneStatus();
+
+    const toneImportBtn = document.getElementById('we-tone-import');
+    const toneFile = document.getElementById('we-tone-file');
+    if (toneImportBtn && toneFile) {
+      toneImportBtn.onclick = () => toneFile.click();
+      toneFile.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const text = String(ev.target.result || '').trim();
+          if (!text) { showToast('文件为空', true); return; }
+          saveTonePrompt(text);
+          updateToneStatus();
+          showToast('附加提示词已导入');
+        };
+        reader.readAsText(file);
+        toneFile.value = '';
+      };
+    }
+
+    const toneExportBtn = document.getElementById('we-tone-export');
+    if (toneExportBtn) {
+      toneExportBtn.onclick = () => {
+        const t = getTonePrompt();
+        if (!t.trim()) { showToast('当前无附加提示词可导出', true); return; }
+        const blob = new Blob([t], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'world-engine-tone-' + Date.now() + '.txt';
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast('附加提示词已导出');
+      };
+    }
+
+    const toneClearBtn = document.getElementById('we-tone-clear');
+    if (toneClearBtn) {
+      toneClearBtn.onclick = () => {
+        if (!getTonePrompt().trim()) { showToast('当前无附加提示词', true); return; }
+        saveTonePrompt('');
+        updateToneStatus();
+        showToast('附加提示词已清除');
+      };
+    }
+
+    // 调试区导出按钮
+    function setupDownload(content, filename) {
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    const exportPromptBtn = document.getElementById('we-export-prompt');
+    if (exportPromptBtn) {
+      exportPromptBtn.onclick = () => {
+        const evo = window.WORLD_ENGINE_EVOLUTION;
+        if (!evo || !evo.getLastDebug) return;
+        const dbg = evo.getLastDebug();
+        if (!dbg.prompt) { showToast('无 Prompt 可导出', true); return; }
+        setupDownload(dbg.prompt, 'prompt-' + Date.now() + '.txt');
+        showToast('Prompt 已导出');
+      };
+    }
+
+    const exportRawBtn = document.getElementById('we-export-raw-result');
+    if (exportRawBtn) {
+      exportRawBtn.onclick = () => {
+        const evo = window.WORLD_ENGINE_EVOLUTION;
+        if (!evo || !evo.getLastDebug) return;
+        const dbg = evo.getLastDebug();
+        if (!dbg.rawResult) { showToast('无 API 返回可导出', true); return; }
+        setupDownload(dbg.rawResult, 'api-raw-' + Date.now() + '.txt');
+        showToast('API 返回已导出');
+      };
+    }
+  }
+
+  function showPanel() {
+    if (!panelElement) buildPanel();
+    panelElement.style.display = 'flex';
+    panelVisible = true;
+    refresh();
+  }
+
+  function hidePanel() {
+    if (!panelElement) return;
+    panelElement.style.display = 'none';
+    panelVisible = false;
+  }
+
+  function togglePanel() {
+    if (panelVisible) hidePanel();
+    else showPanel();
+  }
+
+  function initDrag(panel, handle) {
+    let dragging = false, startX, startY, startLeft, startTop;
+    handle.style.cursor = 'grab';
+
+    handle.addEventListener('mousedown', function(e) {
+      if (e.target.closest('.we-panel-close') || e.target.closest('.we-panel-header-actions')) return;
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      startX = e.clientX; startY = e.clientY;
+      startLeft = rect.left; startTop = rect.top;
+      panel.style.left = startLeft + 'px'; panel.style.top = startTop + 'px';
+      panel.style.right = 'auto'; panel.style.bottom = 'auto';
+      panel.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', function(e) {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      panel.style.left = (startLeft + dx) + 'px';
+      panel.style.top = (startTop + dy) + 'px';
+    });
+
+    document.addEventListener('mouseup', function() {
+      if (!dragging) return;
+      dragging = false;
+      panel.style.cursor = '';
+    });
+  }
+
+  /** 获取当前对话层数 */
+  function getChatLayer() {
+    try {
+      const ctx = SillyTavern.getContext();
+      const chat = ctx?.chat || [];
+      return Math.max(0, chat.length - 1);
+    } catch(e) { return '?'; }
+  }
+
+  /** 设置面板状态条 */
+  function setStatus(text, isError) {
+    const statusBar = document.getElementById('we-status-bar');
+    if (!statusBar) return;
+    statusBar.textContent = text;
+    statusBar.className = 'we-status-bar' + (isError ? ' error' : '');
+  }
+
+  // ========== 全局事件委托：声誉点击 + economy 编辑 ==========
+  document.addEventListener('click', function(e) {
+    // 声誉方块点击
+    var dot = e.target.closest('.we-rep-dot');
+    if (dot) {
+      var dim = dot.getAttribute('data-dim');
+      var level = dot.getAttribute('data-level');
+      if (dim && level) {
+        var scope = dot.getAttribute('data-rep-scope');
+        var s = loadScopedState(scope);
+        s.reputation = s.reputation || {};
+        s.reputation[dim] = level;
+        saveScopedState(scope, s);
+        refresh();
+      }
+      return;
+    }
+    // climate 按钮点击
+    var cb = e.target.closest('.we-climate-btn');
+    if (cb) {
+      var c = cb.getAttribute('data-climate');
+      if (c) {
+        var scope = cb.getAttribute('data-climate-scope');
+        var s = loadScopedState(scope);
+        s.economy = s.economy || {};
+        s.economy.climate = c;
+        saveScopedState(scope, s);
+        refresh();
+      }
+      return;
+    }
+    // 通用列表翻页
+    var arr = e.target.closest('.we-list-arrow');
+    if (arr) {
+      var rid = arr.getAttribute('data-rid');
+      var dir = parseInt(arr.getAttribute('data-dir'));
+      if (!rid || isNaN(dir)) return;
+      // 找到对应的翻页器
+      var pager = arr.parentNode;
+      var curSpan = pager.querySelector('.we-list-cur');
+      if (!curSpan) return;
+      var curPage = parseInt(curSpan.textContent);
+      var list = document.querySelector('.we-paged-list[data-rid="' + rid + '"]');
+      if (!list) return;
+      var items = list.querySelectorAll('.we-page-item');
+      var pages = Array.from(items).map(function(el) {
+        return { el: el, page: parseInt(el.getAttribute('data-page')) };
+      });
+      if (!pages.length) return;
+      var maxPage = Math.max.apply(null, pages.map(function(p){return p.page;}));
+      var newPage = ((curPage - 1 + dir) % maxPage + maxPage) % maxPage + 1;
+      pages.forEach(function(p) { p.el.style.display = p.page === newPage ? '' : 'none'; });
+      curSpan.textContent = newPage;
+      listPageState[rid] = newPage;
+      return;
+    }
+    // 删除 signal
+    var sd = e.target.closest('.we-signal-del');
+    if (sd) {
+      var idx = parseInt(sd.getAttribute('data-sigidx'));
+      if (!isNaN(idx)) {
+        var scope = sd.getAttribute('data-sig-scope');
+        var s = loadScopedState(scope);
+        if (s.economy && s.economy.signals && s.economy.signals[idx] !== undefined) {
+          s.economy.signals.splice(idx, 1);
+          saveScopedState(scope, s);
+          refresh();
+        }
+      }
+      return;
+    }
+    // 添加 signal
+    var sa = e.target.closest('.we-signal-add');
+    if (sa) {
+      var scope = sa.getAttribute('data-sig-scope');
+      var s = loadScopedState(scope);
+      s.economy = s.economy || {};
+      if (!s.economy.signals) s.economy.signals = [];
+      if (s.economy.signals.length < 5) {
+        s.economy.signals.push({ summary: '新信号', scope: '区域' });
+        saveScopedState(scope, s);
+        refresh();
+      }
+      return;
+    }
+
+    // 单击信号卡片后显示删除按钮；再次点击同一卡片时保持显示，方便移动端操作
+    var signalCard = e.target.closest('.we-signal-item');
+    if (signalCard && panelBodyElement && panelBodyElement.contains(signalCard)) {
+      panelBodyElement.querySelectorAll('.we-card-active').forEach(function(c){ c.classList.remove('we-card-active'); });
+      signalCard.classList.add('we-card-active');
+      return;
+    }
+
+    // ===== 单击条目卡片显示/隐藏其编辑按钮（移动端无悬停，统一改为点按）=====
+    if (!panelBodyElement || !panelBodyElement.contains(e.target)) return;
+    // 点在按钮/输入控件/展开的编辑器内：交给各自处理器，不切换
+    if (e.target.closest('button, select, input, textarea, label, a, .we-event-editor, .we-rep-dot, .we-climate-btn, .we-signal-item, .we-list-arrow, .we-nav-row, .we-section-toggle')) return;
+    var card = findActionCard(e.target);
+    var wasActive = card && card.classList.contains('we-card-active');
+    // 先收起其它已展开的卡片
+    panelBodyElement.querySelectorAll('.we-card-active').forEach(function(c){ c.classList.remove('we-card-active'); });
+    if (card && !wasActive) card.classList.add('we-card-active');
+  });
+
+  /** 找到包含编辑按钮组的条目卡片（其直接子节点里有 .we-event-actions / .we-secret-ops） */
+  function findActionCard(target) {
+    var el = target;
+    while (el && el.nodeType === 1 && el.id !== 'we-panel-body') {
+      if (el.querySelector && el.querySelector(':scope > .we-event-actions, :scope > .we-secret-ops')) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // 全局事件委托：signal 双击编辑
+  document.addEventListener('dblclick', function(e) {
+    var sum = e.target.closest('.we-signal-summary');
+    var sc = e.target.closest('.we-signal-scope');
+    if (!sum && !sc) return;
+    e.preventDefault();
+    var item = sum || sc;
+    var isScope = !!sc;
+    var parent = item.closest('.we-signal-item');
+    if (!parent) return;
+    var del = parent.querySelector('.we-signal-del');
+    var idx = del ? parseInt(del.getAttribute('data-sigidx')) : -1;
+    if (isNaN(idx)) return;
+    var dispScope = parent.getAttribute('data-sig-scope');
+    var oldText = item.textContent;
+    item.contentEditable = 'true';
+    item.focus();
+    // select all text
+    var range = document.createRange();
+    range.selectNodeContents(item);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    item.onblur = function() {
+      item.contentEditable = 'false';
+      var s = loadScopedState(dispScope);
+      if (s.economy && s.economy.signals && s.economy.signals[idx]) {
+        if (isScope) s.economy.signals[idx].scope = item.textContent;
+        else s.economy.signals[idx].summary = item.textContent;
+        saveScopedState(dispScope, s);
+      }
+    };
+    item.onkeydown = function(ke) {
+      if (ke.key === 'Enter') { ke.preventDefault(); item.blur(); }
+    };
+  });
+
+  // ========== 推演 UI 状态切换 ==========
+  function setEvolvingUI(active, scope) {
+    // 只置标志，绝不在这里调 refresh()：bindEvents() 每次刷新都会调用本函数，
+    // 一旦回头再 refresh 就会 setEvolvingUI→refresh→bindEvents→setEvolvingUI 无限递归卡死。
+    // 显示哪份由 getActiveInjected 守卫 + _evolvingScope 负责，刷新由调用方在外面做。
+    _evolving = !!active;
+    if (active && scope) _evolvingScope = scope;
+    // 悬浮球卫星按钮：推演中禁用 前进/重新、启用 停止；空闲反之
+    const fwd = document.getElementById('we-sat-forward');
+    const redo = document.getElementById('we-sat-redo');
+    const ab = document.getElementById('we-sat-abort');
+    if (fwd) fwd.classList.toggle('we-sat-off', !!active);
+    if (redo) redo.classList.toggle('we-sat-off', !!active);
+    if (ab) ab.classList.toggle('we-sat-off', !active);
+    const ball = document.getElementById('we-input-btn');
+    if (ball && active) {
+      ball.classList.add('we-ball-evolving');
+      ball.classList.remove('we-ball-success', 'we-ball-fail');
+    } else if (ball && !active) {
+      ball.classList.remove('we-ball-evolving');
+    }
+  }
+
+  function setInjectedScope(scope) {
+    _injectedScope = scope === 'checkpoint' ? 'checkpoint' : 'state';
+  }
+
+  // 手动推演（供悬浮球卫星按钮调用）：显式指定基底，不看 isNewRound。
+  //   重新推进 → 喂存档点 B（mode 'redo'），面板显示存档点；
+  //   向前推进 → 喂当前状态 A（mode 'forward'），面板显示当前状态。
+  async function runManualEvolve(mode, scope) {
+    if (isEvolving) return;
+    if (evolution.isRunning?.()) {
+      if (window.__WE_SetExternalStatus) window.__WE_SetExternalStatus('已有推演进行中...');
+      showToast('已有推演进行中，请稍候');
+      return;
+    }
+    isEvolving = true;
+    setEvolvingUI(true, scope);
+    refresh(true);
+    if (window.__WE_SetExternalStatus) window.__WE_SetExternalStatus('推演中...');
+    try {
+      const ctx = SillyTavern.getContext();
+      const s = core.loadState();
+      const chat = ctx?.chat || [];
+      const lastMsg = chat[chat.length - 1];
+      const userMsg = lastMsg?.is_user ? (lastMsg.mes || '') : '';
+      const aiMsg = !lastMsg?.is_user ? (lastMsg?.mes || '') : '';
+      // 读取轮数：手动/时间模式 → min(自上次推演经过轮数, 上限X)；按轮模式 → a（≤X）。start 做负数保护。
+      const st = window.WORLD_ENGINE_API ? window.WORLD_ENGINE_API.getSettings(true) : {};
+      let rounds;
+      if (st.evolveMode === 'manual' || st.evolveMode === 'time') {
+        const Xmax = Math.max(1, parseInt(st.evolveTimeMaxRounds) || 10);
+        const cpp = core.restoreCheckpoint();
+        const L = core.getChatLayer();
+        let anchorL = (cpp && cpp.chatLayer != null) ? Number(cpp.chatLayer)
+                    : (s && s.chatLayer != null ? Number(s.chatLayer) : L);
+        if (!Number.isFinite(anchorL)) anchorL = L;
+        const since = Math.floor(Math.max(0, L - anchorL) / 2);
+        rounds = Math.max(1, Math.min(since, Xmax));
+      } else {
+        const everyX = Math.max(1, parseInt(st.evolveEveryX) || 1);
+        rounds = Math.min(everyX, Math.max(1, parseInt(st.evolveReadRounds) || 1));
+      }
+      const start = Math.max(0, chat.length - rounds * 2);
+      const dialogueText = chat.slice(start)
+        .map(m => (m.is_user ? '用户' : 'AI') + '：' + core.filterDialogue((m.mes || '').trim(), st))
+        .filter(line => line.length > 3)
+        .join('\n');
+      const ok = await evolution.evolve(s, userMsg, aiMsg, { mode, dialogueText });
+      if (ok && window.WORLD_ENGINE_LEDGER) window.WORLD_ENGINE_LEDGER.recordChanges(s);
+      if (ok && window.WORLD_ENGINE?.applyInjection) window.WORLD_ENGINE.applyInjection();
+      const reason = !ok && evolution.getLastError ? evolution.getLastError() : '';
+      if (window.__WE_SetExternalStatus) window.__WE_SetExternalStatus(ok ? '推演完成' : (reason ? '推演失败：' + reason : '推演失败'), !ok);
+      if (ok) showToast('推演完成');
+    } catch(e) {
+      if (window.__WE_SetExternalStatus) window.__WE_SetExternalStatus('推演失败: ' + e.message, true);
+      showToast('' + e.message, true);
+    }
+    isEvolving = false;
+    setEvolvingUI(false);
+    refresh();
+  }
+
+  // ========== 世界引擎悬浮球 ==========
+  let inputButtonObserver = null;
+  let inputButtonRetryTimer = null;
+  const WE_BALL_POS_KEY = 'we-ball-pos';
+  let _ballStatusTimer = null;
+
+  function loadBallPos() {
+    try {
+      const raw = localStorage.getItem(WE_BALL_POS_KEY);
+      if (raw) {
+        const p = JSON.parse(raw);
+        if (typeof p.left === 'number' && typeof p.top === 'number') return p;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function saveBallPos(left, top, tucked, side) {
+    try { localStorage.setItem(WE_BALL_POS_KEY, JSON.stringify({ left, top, tucked: !!tucked, side: side || null })); } catch (_) {}
+  }
+
+  // 侧边吸附参数
+  const WE_TUCK_EDGE = 28;    // 距边缘多近算「吸附」
+  const WE_TUCK_HANDLE = 15;  // 缩进后露出的小条宽度
+  const WE_TUCK_INSET = 8;    // 拉出后距边缘的留白
+
+  function applyBallTuck(ball, side) {
+    const vw = window.innerWidth;
+    const size = ball.offsetWidth || 52;
+    ball.classList.add('we-ball-tucked');
+    ball.classList.toggle('we-ball-tucked-left', side === 'left');
+    ball.classList.toggle('we-ball-tucked-right', side === 'right');
+    ball.style.left = (side === 'left' ? (WE_TUCK_HANDLE - size) : (vw - WE_TUCK_HANDLE)) + 'px';
+  }
+
+  function untuckBall(ball) {
+    const pos = loadBallPos() || {};
+    const vw = window.innerWidth, vh = window.innerHeight, size = ball.offsetWidth || 52;
+    let left = typeof pos.left === 'number' ? pos.left : (vw - size - 18);
+    let top = typeof pos.top === 'number' ? pos.top : (vh - size - 90);
+    left = Math.max(4, Math.min(left, vw - size - 4));
+    top = Math.max(4, Math.min(top, vh - size - 4));
+    ball.classList.remove('we-ball-tucked', 'we-ball-tucked-left', 'we-ball-tucked-right');
+    ball.style.left = left + 'px';
+    ball.style.top = top + 'px';
+    saveBallPos(left, top, false, null);
+  }
+
+  function applyBallPos(ball) {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const size = ball.offsetWidth || 52;
+    let pos = loadBallPos();
+    if (!pos) pos = { left: vw - size - 44, top: vh - size - 90 };
+    // 钳制进可视区域，避免拖出屏幕后找不到
+    pos.left = Math.max(4, Math.min(pos.left, vw - size - 4));
+    pos.top = Math.max(4, Math.min(pos.top, vh - size - 4));
+    ball.style.top = pos.top + 'px';
+    ball.style.right = 'auto';
+    ball.style.bottom = 'auto';
+    if (pos.tucked && (pos.side === 'left' || pos.side === 'right')) {
+      ball.style.left = pos.left + 'px';   // 记录的是「拉出后」的位置
+      applyBallTuck(ball, pos.side);        // 视觉上缩到边缘
+    } else {
+      ball.classList.remove('we-ball-tucked', 'we-ball-tucked-left', 'we-ball-tucked-right');
+      ball.style.left = pos.left + 'px';
+    }
+  }
+
+  function makeBallDraggable(ball) {
+    let dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    const onDown = (e) => {
+      const pt = e.touches ? e.touches[0] : e;
+      dragging = true; moved = false;
+      sx = pt.clientX; sy = pt.clientY;
+      const rect = ball.getBoundingClientRect();
+      ox = rect.left; oy = rect.top;
+      ball.classList.add('we-ball-dragging');
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+      document.addEventListener('touchmove', onMove, { passive: false });
+      document.addEventListener('touchend', onUp);
+    };
+    const onMove = (e) => {
+      if (!dragging) return;
+      const pt = e.touches ? e.touches[0] : e;
+      const dx = pt.clientX - sx, dy = pt.clientY - sy;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+      if (e.cancelable) e.preventDefault();
+      const size = ball.offsetWidth || 52;
+      let left = Math.max(4, Math.min(ox + dx, window.innerWidth - size - 4));
+      let top = Math.max(4, Math.min(oy + dy, window.innerHeight - size - 4));
+      ball.style.left = left + 'px';
+      ball.style.top = top + 'px';
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      ball.classList.remove('we-ball-dragging');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.removeEventListener('touchmove', onMove);
+      document.removeEventListener('touchend', onUp);
+      if (!moved) return;
+      const vw = window.innerWidth, size = ball.offsetWidth || 52;
+      const left = parseFloat(ball.style.left) || 0;
+      const top = parseFloat(ball.style.top) || 0;
+      if (left <= WE_TUCK_EDGE) {                          // 贴左缘 → 缩进左侧
+        saveBallPos(WE_TUCK_INSET, top, true, 'left');
+        applyBallTuck(ball, 'left');
+      } else if (left >= vw - size - WE_TUCK_EDGE) {        // 贴右缘 → 缩进右侧
+        saveBallPos(vw - size - WE_TUCK_INSET, top, true, 'right');
+        applyBallTuck(ball, 'right');
+      } else {
+        saveBallPos(left, top, false, null);
+      }
+    };
+    ball.addEventListener('mousedown', onDown);
+    ball.addEventListener('touchstart', onDown, { passive: true });
+    // 点击处理：拖动后不算点击；已缩进则「拉出来」而非开面板
+    ball.addEventListener('click', (e) => {
+      if (moved) { e.preventDefault(); e.stopImmediatePropagation(); moved = false; return; }
+      if (ball.classList.contains('we-ball-tucked')) {
+        e.preventDefault(); e.stopImmediatePropagation();
+        untuckBall(ball);
+      }
+    }, true);
+  }
+
+  function observeInputButton() {
+    if (inputButtonObserver || !document.body) return;
+    inputButtonObserver = new MutationObserver(() => {
+      if (!document.getElementById('we-input-btn')) {
+        clearTimeout(inputButtonRetryTimer);
+        inputButtonRetryTimer = setTimeout(buildInputButton, 50);
+      }
+    });
+    inputButtonObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // 解析推演状态文本 → 切换地球形态 + 进度环
+  function setBallState(text, isError) {
+    const ball = document.getElementById('we-input-btn');
+    if (!ball) return;
+    const ring = ball.querySelector('.we-ball-ring');
+    const badge = ball.querySelector('.we-ball-badge');
+    // 悬浮球不显示状态文字（文字走屏幕顶部横幅）
+
+    ball.classList.remove('we-ball-evolving', 'we-ball-success', 'we-ball-fail');
+    clearTimeout(_ballStatusTimer);
+
+    const count = ball.querySelector('.we-ball-count');
+    const clearCount = () => {
+      ball.classList.remove('we-ball-counting');
+      if (count) count.textContent = '';
+      if (ring) ring.style.setProperty('--we-ring-pct', '0deg');
+    };
+
+    if (/推演中/.test(text)) {
+      ball.classList.add('we-ball-evolving');
+      if (badge) badge.textContent = '';
+      clearCount(); // 推演进行中不展示轮次计数，避免残留旧的 N/X
+    } else if (isError || /失败|异常/.test(text)) {
+      ball.classList.add('we-ball-fail');
+      if (badge) badge.textContent = '✕';
+      _ballStatusTimer = setTimeout(() => clearBallBadge(), 6000);
+    } else if (/完成/.test(text)) {
+      ball.classList.add('we-ball-success');
+      if (badge) badge.textContent = '✓';
+      clearCount(); // 推演完成 → 计数已归零，清掉进度环与数字
+      _ballStatusTimer = setTimeout(() => clearBallBadge(), 4000);
+    }
+
+    // 解析「第 N/X 轮」→ 进度环 + 数字（仅未到推演的提示态才显示）
+    const m = /第\s*(\d+)\s*\/\s*(\d+)\s*轮/.exec(text || '');
+    if (ring && m) {
+      const cur = Number(m[1]), total = Number(m[2]) || 1;
+      const pct = Math.max(0, Math.min(1, cur / total));
+      ring.style.setProperty('--we-ring-pct', (pct * 360) + 'deg');
+      ball.classList.toggle('we-ball-counting', cur > 0 && cur < total);
+      if (count) count.textContent = (cur < total) ? `${cur}/${total}` : '';
+    }
+  }
+
+  function clearBallBadge() {
+    const ball = document.getElementById('we-input-btn');
+    if (!ball) return;
+    ball.classList.remove('we-ball-success', 'we-ball-fail');
+    const badge = ball.querySelector('.we-ball-badge');
+    if (badge) badge.textContent = '';
+  }
+
+  // 屏幕正上方状态横幅：显示约 5s 后淡出
+  let _topStatusTimer = null;
+  function showTopStatus(text, isError) {
+    if (!document.body || !text) return;
+    let el = document.getElementById('we-top-status');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'we-top-status';
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.classList.toggle('we-top-status-error', !!isError);
+    el.classList.add('show');
+    clearTimeout(_topStatusTimer);
+    _topStatusTimer = setTimeout(() => { el.classList.remove('show'); }, 5000);
+  }
+
+  // 给悬浮球的三颗卫星按钮绑事件；阻止冒泡，避免触发拖拽 / 打开面板
+  function wireSatellites(ball) {
+    const wire = (id, fn) => {
+      const el = ball.querySelector('#' + id);
+      if (!el) return;
+      const stop = e => e.stopPropagation();
+      el.addEventListener('mousedown', stop);
+      el.addEventListener('touchstart', stop, { passive: true });
+      el.addEventListener('click', (e) => {
+        e.stopPropagation(); e.preventDefault();
+        if (el.classList.contains('we-sat-off')) return;
+        fn();
+      });
+    };
+    wire('we-sat-forward', () => runManualEvolve('forward', 'state'));
+    wire('we-sat-redo', () => runManualEvolve('redo', 'checkpoint'));
+    wire('we-sat-abort', () => { evolution.abort(); showToast('已发送停止信号'); });
+  }
+
+  function buildInputButton() {
+    if (!document.body) return;
+
+    let btn = document.getElementById('we-input-btn');
+    if (!btn) {
+      btn = document.createElement('button');
+      btn.id = 'we-input-btn';
+      btn.type = 'button';
+      btn.title = '世界引擎';
+      btn.setAttribute('aria-label', '世界引擎');
+      btn.className = 'we-ball';
+      btn.innerHTML =
+        '<span class="we-ball-orbit"></span>' +
+        '<span class="we-ball-ring"></span>' +
+        '<span class="we-ball-globe"></span>' +
+        '<span class="we-ball-count"></span>' +
+        '<span class="we-ball-badge"></span>' +
+        '<span class="we-ball-tip"></span>' +
+        '<span class="we-sat we-sat-up" id="we-sat-forward" role="button" title="向前推进"><i class="fa-solid fa-forward"></i></span>' +
+        '<span class="we-sat we-sat-right we-sat-off" id="we-sat-abort" role="button" title="停止推演"><i class="fa-solid fa-stop"></i></span>' +
+        '<span class="we-sat we-sat-down" id="we-sat-redo" role="button" title="重新推进"><i class="fa-solid fa-rotate-right"></i></span>';
+      btn.onclick = () => togglePanel();
+      document.body.appendChild(btn);
+      wireSatellites(btn);
+      applyBallPos(btn);
+      makeBallDraggable(btn);
+      window.addEventListener('resize', () => applyBallPos(btn));
+      setEvolvingUI(isEvolving || Boolean(evolution.isRunning?.()));
+    } else if (btn.parentElement !== document.body) {
+      document.body.appendChild(btn);
+      applyBallPos(btn);
+    }
+
+    // 兼容旧的外部状态接口：保留隐藏元素，转发到地球状态机
+    let statusIndicator = document.getElementById('we-external-status');
+    if (!statusIndicator) {
+      statusIndicator = document.createElement('span');
+      statusIndicator.id = 'we-external-status';
+      statusIndicator.style.display = 'none';
+      document.body.appendChild(statusIndicator);
+    }
+
+    window.__WE_SetExternalStatus = function(text, isError) {
+      const el = document.getElementById('we-external-status');
+      if (el) el.textContent = text;
+      setBallState(text || '', !!isError);
+      // 进度类（第 N/X 轮/天）只在悬浮球上显示；其余状态走屏幕顶部横幅
+      if (text && !/第\s*\d+\s*\/\s*\d+\s*[轮天]/.test(text)) {
+        showTopStatus(text, !!isError);
+      }
+    };
+
+    buildPanel();
+    observeInputButton();
+  }
+
+  return { buildPanel, buildInputButton, showPanel, hidePanel, togglePanel, refresh, setStatus, setEvolvingUI, setInjectedScope };
+})();
