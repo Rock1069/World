@@ -224,12 +224,35 @@ window.WORLD_ENGINE_INJECT = (function() {
     if (worldState.storyType && worldState.storyType.template) {
       const tpl = core.getTemplateById ? core.getTemplateById(worldState.storyType.template) : null;
       const tplName = tpl ? tpl.name : worldState.storyType.template;
-      newSystemParts.push(`故事：${tplName}·阶段${worldState.storyType.currentPhase || 0}·基调${worldState.storyType.tone || 'natural'}`);
+      const toneName = core.getToneDisplayName ? core.getToneDisplayName(worldState.storyType.tone) : (worldState.storyType.tone || '自然');
+      const curPhase = worldState.storyType.currentPhase || 0;
+      const phaseName = (tpl && tpl.phases && tpl.phases[curPhase]) ? tpl.phases[curPhase] : '';
+      let storyLine = `故事：${tplName}·基调${toneName}`;
+      if (tpl && tpl.phases) {
+        storyLine += `·当前阶段「${phaseName}」(${curPhase}/${tpl.phases.length - 1})`;
+      }
+      if (tpl && tpl.promptBlock) {
+        storyLine += `\n故事节奏：${tpl.promptBlock}`;
+      }
+      newSystemParts.push(storyLine);
     }
 
     // 世界法则
-    if (worldState.worldLaws && worldState.worldLaws.framework !== 'custom') {
-      newSystemParts.push(`法则：${worldState.worldLaws.frameworkName || worldState.worldLaws.framework}`);
+    if (worldState.worldLaws && worldState.worldLaws.dimensions) {
+      const wl = worldState.worldLaws;
+      const dimParts = [];
+      const dims = wl.dimensions || {};
+      Object.entries(dims).forEach(([k, v]) => {
+        const label = (typeof v === 'object' && v) ? v.label : k;
+        const value = (typeof v === 'object' && v) ? v.value : String(v);
+        dimParts.push(`${label}${value}`);
+      });
+      let lawLine = `世界法则：${wl.frameworkName || '自定义'}（${dimParts.join('、')}）`;
+      const rules = (wl.customRules || []).slice(0, 3);
+      if (rules.length) {
+        lawLine += `\n世界规则：${rules.join('；')}`;
+      }
+      newSystemParts.push(lawLine);
     }
 
     // 情感摘要

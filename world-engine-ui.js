@@ -332,7 +332,8 @@ window.WORLD_ENGINE_UI = (function() {
   const VIEW_TITLES = {
     situation: '局势', events: '事件', relations: '关系', resources: '资源', settings: '设置',
     // ★ 新系统视图
-    achievements: '成就·战斗', world_board: '法则·故事', plot_board: '线索·情感'
+    achievements: '成就·战斗', world_board: '法则·故事', plot_board: '线索·情感',
+    location_board: '地点总览'
   };
 
   function renderSection(title, id, content) {
@@ -353,6 +354,7 @@ window.WORLD_ENGINE_UI = (function() {
       { view: 'achievements', label: '成就', sub: '成就解锁 · 战斗战绩 · 连击', poem: '功成名就' },
       { view: 'world_board',  label: '世界', sub: '世界法则 · 故事方向 · 世界时间', poem: '天道有序' },
       { view: 'plot_board',   label: '线索', sub: '全局线索板 · 情感地图',   poem: '草蛇灰线' },
+      { view: 'location_board', label: '地点', sub: '地点总览 · 势力分布 · 风声覆盖', poem: '纵横捭阖' },
     ];
 
     const navRows = rows.map((r, i) => {
@@ -395,7 +397,8 @@ window.WORLD_ENGINE_UI = (function() {
       + renderSection('故事方向', 'storytype', renderStoryTypePanel(s))
       + renderSection('世界时间', 'worldtime', renderWorldTimePanel(s))
       + renderSection('全局线索板', 'globalplots', renderGlobalPlotBoard(s))
-      + renderSection('情感地图', 'emotionmap', renderEmotionMapPanel(s));
+      + renderSection('情感地图', 'emotionmap', renderEmotionMapPanel(s))
+      + renderSection('地点总览', 'locboard', renderLocationBoard(s));
   }
 
   function renderSubView(viewKey, s, layer, scope) {
@@ -428,6 +431,8 @@ window.WORLD_ENGINE_UI = (function() {
     } else if (viewKey === 'plot_board') {
       content = renderSection('全局线索板', 'globalplots', renderGlobalPlotBoard(s))
         + renderSection('情感地图', 'emotionmap', renderEmotionMapPanel(s));
+    } else if (viewKey === 'location_board') {
+      content = renderSection('地点总览', 'locboard', renderLocationBoard(s));
     }
     return '<div class="we-sub-topbar">'
       + '<button class="we-icon-btn" id="we-btn-back" title="返回"><i class="fa-solid fa-arrow-left"></i></button>'
@@ -1129,14 +1134,24 @@ window.WORLD_ENGINE_UI = (function() {
 
   function renderWorldLawsPanel(s) {
     const wl = s.worldLaws || {};
-    let html = '<div style="font-size:11px;color:#c0c8d4;margin-bottom:4px;">'
-      + '框架: <strong>' + u(wl.frameworkName || wl.framework || '自定义') + '</strong></div>';
+    const presets = core.WORLD_LAW_PRESETS || [];
+    let html = '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
+      + '<span style="font-size:11px;color:#8e99a4;">框架:</span>'
+      + '<select class="we-preset-select" data-action="worldlaw-preset">';
+    html += '<option value="custom"' + (wl.framework === 'custom' ? ' selected' : '') + '>自定义世界</option>';
+    presets.forEach(function(p) { html += '<option value="' + p.id + '"' + (wl.framework === p.id ? ' selected' : '') + '>' + p.icon + ' ' + u(p.name) + '</option>'; });
+    html += '</select></div>';
     // 维度
     const dims = wl.dimensions || {};
     const dimEntries = Object.entries(dims);
     if (dimEntries.length) {
       html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:11px;color:#8e99a4;margin-bottom:4px;">';
-      dimEntries.forEach(function(entry) { html += '<div>' + u(entry[0]) + ': <strong style="color:#c0c8d4;">' + entry[1] + '</strong></div>'; });
+      dimEntries.forEach(function(entry) {
+        var dimObj = entry[1];
+        var label = (typeof dimObj === 'object' && dimObj) ? dimObj.label : entry[0];
+        var value = (typeof dimObj === 'object' && dimObj) ? dimObj.value : String(dimObj);
+        html += '<div>' + u(label) + ': <strong style="color:#c0c8d4;">' + u(value || '未知') + '</strong></div>';
+      });
       html += '</div>';
     }
     // 自定义规则
@@ -1156,18 +1171,32 @@ window.WORLD_ENGINE_UI = (function() {
 
   function renderStoryTypePanel(s) {
     const st = s.storyType || {};
-    if (!st.template) return '<div class="we-empty">未设定故事方向</div>';
+    const templates = core.STORY_TEMPLATES || [];
+    const tones = core.EMOTIONAL_TONES || [];
     const tpl = core.getTemplateById ? core.getTemplateById(st.template) : null;
     const tplName = tpl ? tpl.name : st.template;
-    let html = '<div style="font-size:11px;color:#c0c8d4;">'
-      + '模板: <strong>' + u(tplName) + '</strong> | 阶段: <strong>' + (st.currentPhase || 0) + '</strong>'
-      + (tpl && tpl.phases ? '/' + tpl.phases.length : '')
-      + ' | 基调: <strong>' + u(st.tone || 'natural') + '</strong></div>';
-    if (tpl && tpl.phases && tpl.phases[st.currentPhase]) {
-      html += '<div style="font-size:11px;color:#58b8a9;margin-top:2px;">当前阶段: ' + u(tpl.phases[st.currentPhase]) + '</div>';
-    }
-    if (st.phaseProgress > 0) {
-      html += '<div style="font-size:11px;color:#8e99a4;">阶段进度: ' + (st.phaseProgress || 0) + '%</div>';
+    let html = '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap;">'
+      + '<span style="font-size:11px;color:#8e99a4;">模板:</span>'
+      + '<select class="we-preset-select" data-action="story-template">'
+      + '<option value=""' + (!st.template ? ' selected' : '') + '>未设定</option>';
+    templates.forEach(function(t) { html += '<option value="' + t.id + '"' + (st.template === t.id ? ' selected' : '') + '>' + u(t.name) + '</option>'; });
+    html += '</select>'
+      + '<span style="font-size:11px;color:#8e99a4;">基调:</span>'
+      + '<select class="we-preset-select" data-action="story-tone">'
+      + '<option value="natural"' + ((st.tone || 'natural') === 'natural' ? ' selected' : '') + '>自然</option>';
+    tones.forEach(function(t) { html += '<option value="' + t.id + '"' + (st.tone === t.id ? ' selected' : '') + '>' + u(t.name) + '</option>'; });
+    html += '</select></div>';
+    if (tpl) {
+      html += '<div style="font-size:11px;color:#c0c8d4;">阶段: <strong>' + (st.currentPhase || 0) + '/' + (tpl.phases ? tpl.phases.length : 0) + '</strong>';
+      if (tpl.phases && tpl.phases[st.currentPhase]) {
+        html += ' · 当前: <strong style="color:#58b8a9;">' + u(tpl.phases[st.currentPhase]) + '</strong>';
+      }
+      html += '</div>';
+      if (st.phaseProgress > 0) {
+        html += '<div style="font-size:11px;color:#8e99a4;">阶段进度: ' + (st.phaseProgress || 0) + '%</div>';
+      }
+    } else if (!st.template) {
+      html += '<div style="font-size:11px;color:#5e6670;margin-top:2px;">选择模板后，推演将按该故事节奏推进</div>';
     }
     return html;
   }
@@ -1236,6 +1265,108 @@ window.WORLD_ENGINE_UI = (function() {
         + (reasons.length ? '<div style="font-size:10px;color:#666;">原因: ' + reasons.slice(-3).map(function(r) { return u(r); }).join(', ') + '</div>' : '')
         + '</div>';
     }).join('');
+  }
+
+  // ========== 地点总览 ==========
+
+  function renderLocationBoard(s) {
+    // 按地点聚合 NPC
+    var locMap = {};
+    (s.npcs || []).forEach(function(npc) {
+      var loc = npc.location || '未知';
+      if (!locMap[loc]) locMap[loc] = { npcs: [], factions: [], winds: [], events: [], incidents: [] };
+      locMap[loc].npcs.push(npc);
+    });
+    // 按范围聚合势力
+    (s.factions || []).forEach(function(f) {
+      var sc = f.scope || '未知';
+      if (!locMap[sc]) locMap[sc] = { npcs: [], factions: [], winds: [], events: [], incidents: [] };
+      locMap[sc].factions.push(f);
+    });
+    // 按范围聚合风声
+    (s.winds || []).forEach(function(w) {
+      var sc = w.scope || '未知';
+      if (!locMap[sc]) locMap[sc] = { npcs: [], factions: [], winds: [], events: [], incidents: [] };
+      locMap[sc].winds.push(w);
+    });
+    // 区域事件
+    var ri = s.regionalIncident;
+    if (ri && ri.active) {
+      var riScope = ri.scope || '未知';
+      if (!locMap[riScope]) locMap[riScope] = { npcs: [], factions: [], winds: [], events: [], incidents: [] };
+      locMap[riScope].incidents.push(ri);
+    }
+
+    var locEntries = Object.entries(locMap).sort(function(a, b) {
+      return (b[1].npcs.length + b[1].factions.length) - (a[1].npcs.length + a[1].factions.length);
+    });
+
+    if (!locEntries.length) return '<div class="we-empty">暂无地点数据</div>';
+
+    var html = '<div style="font-size:10px;color:#5e6670;margin-bottom:6px;">共 ' + locEntries.length + ' 个地点 · 按活跃度排序</div>';
+
+    locEntries.forEach(function(entry) {
+      var loc = entry[0];
+      var data = entry[1];
+      var totalCount = data.npcs.length + data.factions.length + data.winds.length + data.incidents.length;
+
+      html += '<div style="margin-bottom:6px;padding:5px 8px;background:rgba(88,184,169,0.04);border-radius:6px;border-left:3px solid rgba(88,184,169,0.3);">';
+      // 地点标题
+      html += '<div style="font-size:12px;font-weight:600;color:#58b8a9;margin-bottom:3px;">📍 ' + u(loc)
+        + ' <span style="font-size:10px;color:#5e6670;font-weight:400;">(' + totalCount + ')</span></div>';
+
+      // NPC 列表
+      if (data.npcs.length) {
+        data.npcs.forEach(function(npc) {
+          var statusColor = NPC_STATUS_COLORS[npc.status] || '#c0c8d4';
+          html += '<div style="font-size:11px;color:#c0c8d4;padding:1px 0 1px 12px;">'
+            + (npc.icon || '👤') + ' <strong>' + u(npc.name) + '</strong>'
+            + (npc.role ? ' <span style="color:#8e99a4;">(' + u(npc.role) + ')</span>' : '')
+            + (npc.faction ? ' <span style="color:#666;">[' + u(npc.faction) + ']</span>' : '')
+            + ' <span style="color:' + statusColor + ';font-size:10px;">' + (NPC_STATUS_LABELS[npc.status] || npc.status) + '</span>'
+            + '</div>';
+        });
+      }
+
+      // 势力
+      if (data.factions.length) {
+        data.factions.forEach(function(f) {
+          var relColors = { '盟友': '#58b8a9', '友好': '#67c23a', '中立': '#909399', '敌对': '#e6a23c', '世仇': '#f56c6c' };
+          var relColor = relColors[f.relation] || '#c0c8d4';
+          html += '<div style="font-size:11px;color:#c0c8d4;padding:1px 0 1px 12px;">'
+            + '🏛️ <strong>' + u(f.name) + '</strong>'
+            + ' <span style="color:' + relColor + ';font-size:10px;">' + u(f.relation || '未知') + '</span>'
+            + (f.core_person ? ' <span style="color:#666;">核心:' + u(f.core_person) + '</span>' : '')
+            + '</div>';
+        });
+      }
+
+      // 风声
+      if (data.winds.length) {
+        data.winds.forEach(function(w) {
+          var typeIcons = { report: '📜', message: '📨', rumor: '🗣️', sentiment: '🌊' };
+          var typeLabels = { report: '公告', message: '消息', rumor: '流言', sentiment: '舆情' };
+          html += '<div style="font-size:11px;color:#8e99a4;padding:1px 0 1px 12px;">'
+            + (typeIcons[w.type] || '📢') + ' <span style="color:#666;">[' + (typeLabels[w.type] || w.type) + ' Lv.' + (w.level || 1) + ']</span> '
+            + u(w.topic || '')
+            + '</div>';
+        });
+      }
+
+      // 区域事件
+      if (data.incidents.length) {
+        data.incidents.forEach(function(inc) {
+          html += '<div style="font-size:11px;color:#e6a23c;padding:1px 0 1px 12px;">'
+            + '⚠️ <strong>' + u(inc.title || '') + '</strong>'
+            + (inc.type ? ' <span style="color:#666;">(' + u(inc.type) + ')</span>' : '')
+            + '</div>';
+        });
+      }
+
+      html += '</div>';
+    });
+
+    return html;
   }
 
   // ========== NPC 渲染 ==========
@@ -3203,6 +3334,38 @@ window.WORLD_ENGINE_UI = (function() {
     item.onkeydown = function(ke) {
       if (ke.key === 'Enter') { ke.preventDefault(); item.blur(); }
     };
+  });
+
+  // ========== 世界法则/故事模板 select 事件处理 ==========
+  document.addEventListener('change', function(e) {
+    var sel = e.target.closest('.we-preset-select');
+    if (!sel) return;
+    var action = sel.getAttribute('data-action');
+    var val = sel.value;
+    var state = core.loadState();
+    if (action === 'worldlaw-preset') {
+      if (val === 'custom') {
+        state.worldLaws = state.worldLaws || {};
+        state.worldLaws.framework = 'custom';
+        state.worldLaws.frameworkName = '自定义世界';
+        core.saveState(state);
+      } else {
+        core.applyWorldLawPreset(state, val);
+      }
+      refresh();
+    } else if (action === 'story-template') {
+      state.storyType = state.storyType || {};
+      state.storyType.template = val || null;
+      state.storyType.currentPhase = 0;
+      state.storyType.phaseProgress = 0;
+      core.saveState(state);
+      refresh();
+    } else if (action === 'story-tone') {
+      state.storyType = state.storyType || {};
+      state.storyType.tone = val || 'natural';
+      core.saveState(state);
+      refresh();
+    }
   });
 
   // ========== 推演 UI 状态切换 ==========
