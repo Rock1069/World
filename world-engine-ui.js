@@ -1202,20 +1202,75 @@ window.WORLD_ENGINE_UI = (function() {
   }
 
   function renderWorldTimePanel(s) {
-    const mins = s.inWorldMinutes || 0;
-    const days = Math.floor(mins / 1440);
-    const hours = Math.floor((mins % 1440) / 60);
-    const m = mins % 60;
-    const timeStr = days > 0 ? days + '天' + hours + '时' + m + '分' : hours > 0 ? hours + '时' + m + '分' : m + '分钟';
-    let html = '<div style="font-size:12px;color:#c0c8d4;margin-bottom:4px;">⏱ 世界时间: <strong>' + timeStr + '</strong> (' + mins + '分钟)</div>';
+    var totalMins = (s.worldTimeEpoch || 0) + (s.inWorldMinutes || 0);
+    var info = core.getWorldTimeInfo ? core.getWorldTimeInfo(totalMins) : null;
+    var label = s.worldTimeLabel ? s.worldTimeLabel + ' ' : '';
+
+    // 时辰显示
+    let html = '<div style="text-align:center;padding:8px 0;margin-bottom:6px;">';
+    if (info) {
+      var SHICHEN = core.SHICHEN || [];
+      html += '<div style="font-size:20px;font-weight:700;color:#58b8a9;">' + u(info.shichen) + '</div>';
+      html += '<div style="font-size:11px;color:#8e99a4;margin-top:2px;">' + u(info.modern) + ' · ' + u(info.animal) + '</div>';
+      html += '<div style="font-size:13px;color:#c0c8d4;margin-top:4px;">' + u(label + info.dayName) + '</div>';
+      // 时辰圆盘
+      html += '<div style="display:flex;flex-wrap:wrap;justify-content:center;gap:3px;margin-top:8px;">';
+      SHICHEN.forEach(function(sc) {
+        var isActive = sc.name === info.shichen;
+        html += '<div style="font-size:9px;padding:2px 5px;border-radius:3px;'
+          + 'background:' + (isActive ? 'rgba(88,184,169,0.2)' : 'rgba(255,255,255,0.03)') + ';'
+          + 'color:' + (isActive ? '#58b8a9' : '#5e6670') + ';'
+          + 'border:1px solid ' + (isActive ? '#58b8a9' : 'rgba(255,255,255,0.05)') + ';">'
+          + sc.branch + '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div style="font-size:12px;color:#8e99a4;">⏱ 已过 ' + (s.inWorldMinutes || 0) + ' 分钟</div>';
+    }
+    html += '</div>';
+
+    // 时间设置（初始时间）
+    html += '<div style="font-size:10px;color:#5e6670;text-align:center;margin-bottom:6px;">累计经过: ' + (s.inWorldMinutes || 0) + ' 分钟 (已推演 ' + (s.round || 0) + ' 轮)</div>';
+
+    // 时间日志
     const logs = s.timeLogs || [];
     if (logs.length) {
       html += '<details><summary style="font-size:11px;color:#58b8a9;cursor:pointer;">时间日志 (' + logs.length + ')</summary><div style="margin-top:4px;">';
       html += logs.slice(0, 20).map(function(l) {
-        return '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">第' + l.round + '轮 +' + l.minutes + '分钟 (' + u(l.source) + ') 累计' + l.total + '分钟</div>';
+        var wt = l.worldTime || '';
+        return '<div style="font-size:11px;color:#a0a8b4;padding:1px 0;">第' + l.round + '轮 +' + l.minutes + '分钟'
+          + (wt ? ' → ' + u(wt) : '')
+          + ' <span style="color:#5e6670;">(' + u(l.source) + ')</span></div>';
       }).join('');
       html += '</div></details>';
     }
+
+    // 世界切换历史
+    var transLog = s.worldTransitionLog || [];
+    if (transLog.length) {
+      html += '<details style="margin-top:6px;"><summary style="font-size:11px;color:#b37feb;cursor:pointer;">🌀 穿越记录 (' + transLog.length + ')</summary><div style="margin-top:4px;">';
+      html += transLog.slice(-10).map(function(t) {
+        return '<div style="font-size:11px;color:#a0a8b4;padding:2px 0;border-bottom:1px solid rgba(179,127,235,0.1);">'
+          + '<span style="color:#b37feb;">第' + t.round + '轮</span> '
+          + u(t.from.framework || '未知') + ' → <strong style="color:#c0c8d4;">' + u(t.to.framework || '未知') + '</strong>'
+          + (t.reason ? ' <span style="color:#5e6670;">(' + u(t.reason) + ')</span>' : '')
+          + '</div>';
+      }).join('');
+      html += '</div></details>';
+    }
+
+    // 快速穿越按钮
+    html += '<div style="margin-top:8px;text-align:center;">'
+      + '<select class="we-preset-select" data-action="world-transition" style="max-width:180px;">'
+      + '<option value="">🌀 穿越到...</option>';
+    var presets = core.WORLD_LAW_PRESETS || [];
+    presets.forEach(function(p) {
+      html += '<option value="' + p.id + '">' + p.icon + ' ' + u(p.name) + '</option>';
+    });
+    html += '<option value="custom_modern">🏢 现代世界</option>'
+      + '<option value="custom_scifi">🚀 科幻世界</option>'
+      + '</select></div>';
+
     return html;
   }
 
@@ -3364,6 +3419,30 @@ window.WORLD_ENGINE_UI = (function() {
       state.storyType = state.storyType || {};
       state.storyType.tone = val || 'natural';
       core.saveState(state);
+      refresh();
+    } else if (action === 'world-transition') {
+      if (!val) return; // 空选项不触发
+      var config = { reason: '手动穿越' };
+      if (val === 'custom_modern') {
+        config.framework = 'modern';
+        config.frameworkName = '现代世界';
+        config.dimensions = { magic: '无', tech: '现代', supernatural: '无', governance: '共和制', conflict: '生存', environment: '多样' };
+        config.customRules = ['智能手机和互联网是基础设施', '法律是社会运行的核心'];
+        config.timeLabel = '2025年';
+        config.timeEpoch = 0;
+      } else if (val === 'custom_scifi') {
+        config.framework = 'scifi';
+        config.frameworkName = '科幻世界';
+        config.dimensions = { magic: '无', tech: '科幻', supernatural: '罕见', governance: '共和制', conflict: '求知', environment: '多样' };
+        config.customRules = ['星际旅行是常态', 'AI与人类共存'];
+        config.timeLabel = '星历元年';
+        config.timeEpoch = 0;
+      } else {
+        config.preset = val;
+      }
+      core.applyWorldTransition(state, config);
+      // 重置 select 显示
+      sel.value = '';
       refresh();
     }
   });

@@ -271,12 +271,14 @@ window.WORLD_ENGINE_INJECT = (function() {
     }
 
     // 世界时间
-    if (worldState.inWorldMinutes > 0) {
-      const days = Math.floor(worldState.inWorldMinutes / 1440);
-      const hours = Math.floor((worldState.inWorldMinutes % 1440) / 60);
-      const mins = worldState.inWorldMinutes % 60;
-      const timeStr = days > 0 ? `${days}天${hours}时${mins}分` : hours > 0 ? `${hours}时${mins}分` : `${mins}分钟`;
-      newSystemParts.push(`世界时间：已过${timeStr}`);
+    {
+      const totalWorldMins = (worldState.worldTimeEpoch || 0) + (worldState.inWorldMinutes || 0);
+      if (totalWorldMins > 0 || worldState.worldTimeLabel) {
+        const timeDisplay = core.getWorldTimeDisplay ? core.getWorldTimeDisplay(worldState) : '';
+        if (timeDisplay) {
+          newSystemParts.push(`世界时间：${timeDisplay}`);
+        }
+      }
     }
 
     // 连击

@@ -704,6 +704,25 @@ eventType 取值: praise/insult/betray/help/threat/gift/loss/surprise/witness/co
 
 ### timeElapsed（世界时间，可选）
 本轮经过的世界时间（分钟），数字。仅在有时间流逝意义时返回。
+
+### worldTransition（世界切换/穿越，可选）
+仅当叙事中发生世界观级别的转变时才返回，如：穿越、时空跳转、进入异世界。
+{ preset, framework, frameworkName, dimensions, customRules, timeEpoch, timeLabel, storyTemplate, tone, reason }
+字段说明：
+- preset: 预设ID（如 "high_fantasy"/"cyber_xianxia"/"wuxia" 等），设置后自动填充维度和规则
+- framework/frameworkName: 自定义世界框架名（与 preset 二选一）
+- dimensions: 自定义维度值，如 { magic: "高", tech: "现代", supernatural: "丰富" }
+- customRules: 自定义规则数组（替换旧规则）
+- timeEpoch: 新世界时间起点（分钟数，如 2天巳时 = 2*720+300 = 1740）
+- timeLabel: 时间标签（如 "天宝三载"、"2025年"、"星历 3077"）
+- storyTemplate: 新故事模板 ID（如 "hero_journey"/"rags_to_riches"）
+- tone: 新情感基调（如 "epic"/"dark"/"cozy"）
+- reason: 切换原因（如 "主角穿越到现代世界"）
+注意：
+- 切换后新世界的时间从 0 重新开始计算
+- 旧世界的 NPC、势力、事件保留（它们属于旧世界）
+- 如果仅改变时间/基调而不改变世界观，可只传 timeLabel/tone
+- 禁止每轮都返回，仅在确实发生世界转换时触发
 `;
 
   const JSON_EXAMPLE = `{
@@ -792,6 +811,7 @@ ${JSON.stringify({
   emotionMap: state.emotionMap ? Object.fromEntries(Object.entries(state.emotionMap).slice(0, 8).map(([k,v]) => [k, { emotion: v.emotion, attitude: v.attitude, intensity: v.intensity }])) : {},
   globalPlotThreads: (state.globalPlotThreads || []).filter(t => t.status === 'active').slice(0, 5).map(t => ({ id: t.id, title: t.title, progress: t.progress, status: t.status })),
   inWorldMinutes: state.inWorldMinutes || 0,
+  worldTime: core.getWorldTimeDisplay ? core.getWorldTimeDisplay(state) : '',
   combo: state.combo || 0
 }, null, 2)}
 
@@ -812,7 +832,7 @@ ${extraInstruction ? '\n' + extraInstruction : ''}${toneSection}`;
     const knownFields = [
       'events', 'factions', 'worldTrends', 'winds', 'economy', 'reputation',
       'world_digest', 'enemies', 'influenceChain', 'regionalIncident', 'blackbox', 'npcs',
-      'achievements', 'combat', 'emotionChanges', 'plotThreads', 'storyProgression', 'worldLawChanges', 'timeElapsed'
+      'achievements', 'combat', 'emotionChanges', 'plotThreads', 'storyProgression', 'worldLawChanges', 'timeElapsed', 'worldTransition'
     ];
     if (!knownFields.some(field => Object.prototype.hasOwnProperty.call(update, field))) {
       throw new Error('API 返回不包含任何世界状态字段，已保留重 roll 前的当前状态');
@@ -841,6 +861,7 @@ ${extraInstruction ? '\n' + extraInstruction : ''}${toneSection}`;
     if (!update.storyProgression) update.storyProgression = null;
     if (!update.worldLawChanges) update.worldLawChanges = [];
     if (update.timeElapsed === undefined) update.timeElapsed = null;
+    if (!update.worldTransition) update.worldTransition = null;
 
     return update;
   }
@@ -893,12 +914,15 @@ ${extraInstruction ? '\n' + extraInstruction : ''}${toneSection}`;
         state.combat = cp.combat || state.combat || {};
         state.emotionMap = cp.emotionMap || state.emotionMap || {};
         state.inWorldMinutes = cp.inWorldMinutes !== undefined ? cp.inWorldMinutes : (state.inWorldMinutes || 0);
+        state.worldTimeEpoch = cp.worldTimeEpoch !== undefined ? cp.worldTimeEpoch : (state.worldTimeEpoch || 0);
+        state.worldTimeLabel = cp.worldTimeLabel !== undefined ? cp.worldTimeLabel : (state.worldTimeLabel || '');
         state.timeLogs = cp.timeLogs || state.timeLogs || [];
         state.globalPlotThreads = cp.globalPlotThreads || state.globalPlotThreads || [];
         state.npcSchedules = cp.npcSchedules || state.npcSchedules || {};
         state.achievementEchoes = cp.achievementEchoes || state.achievementEchoes || [];
         state.characterLifecycles = cp.characterLifecycles || state.characterLifecycles || {};
         state.eventLog = cp.eventLog || state.eventLog || [];
+        state.worldTransitionLog = cp.worldTransitionLog || state.worldTransitionLog || [];
         console.log('[世界引擎] 🔄 检测到重roll，从存档点恢复');
       }
     }
@@ -1205,9 +1229,14 @@ ${extraInstruction ? '\n' + extraInstruction : ''}${toneSection}`;
         if (constraints.length) core.setWorldLawDerivedConstraints(state, constraints);
       }
 
-      // 世界时间推进
-      if (update.timeElapsed && update.timeElapsed > 0) {
-        core.addTimeLog(state, update.timeElapsed, 'evolve');
+      // 世界时间推进（AI 返回时间用 AI 的，否则每轮自动推进 30 分钟保底）
+      var timeToAdd = (update.timeElapsed && update.timeElapsed > 0) ? update.timeElapsed : 30;
+      core.addTimeLog(state, timeToAdd, update.timeElapsed > 0 ? 'evolve' : 'auto');
+
+      // ★ 世界切换（穿越/转场）
+      if (update.worldTransition && typeof update.worldTransition === 'object') {
+        core.applyWorldTransition(state, update.worldTransition);
+        console.log('[World Engine] 🌀 世界切换完成: ' + (update.worldTransition.reason || '未知原因'));
       }
 
       // NPC 日程更新（根据情感变化）

@@ -256,12 +256,15 @@ window.WORLD_ENGINE_CORE = (function() {
       },
       emotionMap: {},
       inWorldMinutes: 0,
+      worldTimeEpoch: 0,
+      worldTimeLabel: '',
       lastTimeCheckRound: 0,
       timeLogs: [],
       globalPlotThreads: [],
       npcSchedules: {},
       achievementEchoes: [],
       characterLifecycles: {},
+      worldTransitionLog: [],
       lastEvolveResult: null,
       lastInjection: null,
       lastUpdated: {}
@@ -484,6 +487,8 @@ window.WORLD_ENGINE_CORE = (function() {
     // ========== 情感/时间/日程/线索/生命周期 ==========
     state.emotionMap = state.emotionMap || {};
     state.inWorldMinutes = state.inWorldMinutes || 0;
+    state.worldTimeEpoch = state.worldTimeEpoch !== undefined ? state.worldTimeEpoch : 0;
+    state.worldTimeLabel = state.worldTimeLabel || '';
     state.lastTimeCheckRound = state.lastTimeCheckRound || 0;
     state.timeLogs = Array.isArray(state.timeLogs) ? state.timeLogs : [];
     state.globalPlotThreads = Array.isArray(state.globalPlotThreads) ? state.globalPlotThreads : [];
@@ -500,6 +505,7 @@ window.WORLD_ENGINE_CORE = (function() {
     if (state.globalPlotThreads.length > 30) state.globalPlotThreads.length = 30;
     state.npcSchedules = state.npcSchedules || {};
     state.characterLifecycles = state.characterLifecycles || {};
+    state.worldTransitionLog = Array.isArray(state.worldTransitionLog) ? state.worldTransitionLog : [];
     state.lastInjection = state.lastInjection || null;
     return state;
   }
@@ -1384,14 +1390,176 @@ window.WORLD_ENGINE_CORE = (function() {
 
   // ========== 世界时间 ==========
 
+  // 十二时辰系统（每时辰 = 60 世界分钟，一天 = 720 分钟）
+  var SHICHEN = [
+    { name: '子时', branch: '子', animal: '鼠', start: 0,   end: 60,  modern: '00:00-01:00' },
+    { name: '丑时', branch: '丑', animal: '牛', start: 60,  end: 120, modern: '01:00-03:00' },
+    { name: '寅时', branch: '寅', animal: '虎', start: 120, end: 180, modern: '03:00-05:00' },
+    { name: '卯时', branch: '卯', animal: '兔', start: 180, end: 240, modern: '05:00-07:00' },
+    { name: '辰时', branch: '辰', animal: '龙', start: 240, end: 300, modern: '07:00-09:00' },
+    { name: '巳时', branch: '巳', animal: '蛇', start: 300, end: 360, modern: '09:00-11:00' },
+    { name: '午时', branch: '午', animal: '马', start: 360, end: 420, modern: '11:00-13:00' },
+    { name: '未时', branch: '未', animal: '羊', start: 420, end: 480, modern: '13:00-15:00' },
+    { name: '申时', branch: '申', animal: '猴', start: 480, end: 540, modern: '15:00-17:00' },
+    { name: '酉时', branch: '酉', animal: '鸡', start: 540, end: 600, modern: '17:00-19:00' },
+    { name: '戌时', branch: '戌', animal: '狗', start: 600, end: 660, modern: '19:00-21:00' },
+    { name: '亥时', branch: '亥', animal: '猪', start: 660, end: 720, modern: '21:00-23:00' }
+  ];
+  var DAY_NAMES = ['初一','初二','初三','初四','初五','初六','初七','初八','初九','初十',
+    '十一','十二','十三','十四','十五','十六','十七','十八','十九','二十',
+    '廿一','廿二','廿三','廿四','廿五','廿六','廿七','廿八','廿九','三十'];
+
+  /**
+   * 将世界分钟数转换为时辰信息
+   * @param {number} totalMinutes - 总世界分钟数（inWorldMinutes + worldTimeEpoch）
+   * @returns {object} { day, dayName, shichen, animal, modern, hourInDay }
+   */
+  function getWorldTimeInfo(totalMinutes) {
+    var mins = Math.max(0, Math.floor(totalMinutes || 0));
+    var day = Math.floor(mins / 720);  // 0-based day index
+    var minInDay = mins % 720;
+    var shichen = SHICHEN[0];
+    for (var i = 0; i < SHICHEN.length; i++) {
+      if (minInDay >= SHICHEN[i].start && minInDay < SHICHEN[i].end) { shichen = SHICHEN[i]; break; }
+    }
+    var dayName = DAY_NAMES[day % 30] || ('第' + (day + 1) + '天');
+    return {
+      day: day,
+      dayName: dayName,
+      shichen: shichen.name,
+      branch: shichen.branch,
+      animal: shichen.animal,
+      modern: shichen.modern,
+      minInDay: minInDay,
+      hourInDay: Math.floor(minInDay / 60 * 2) // 0-23 approximate
+    };
+  }
+
+  /**
+   * 获取当前世界时间的显示字符串
+   */
+  function getWorldTimeDisplay(state) {
+    var total = (state.worldTimeEpoch || 0) + (state.inWorldMinutes || 0);
+    var info = getWorldTimeInfo(total);
+    var label = state.worldTimeLabel ? state.worldTimeLabel + ' ' : '';
+    return label + info.dayName + ' ' + info.shichen + '（' + info.modern + '）';
+  }
+
+  /**
+   * 设置世界时间起点
+   * @param {object} state
+   * @param {number} epochMinutes - 起点分钟数（如“初三巳时”= 2*720+300 = 1740）
+   * @param {string} label - 时间标签（如“天宝三载”）
+   */
+  function setWorldTimeEpoch(state, epochMinutes, label) {
+    state.worldTimeEpoch = Math.max(0, epochMinutes || 0);
+    state.worldTimeLabel = label || '';
+    saveState(state);
+    return getWorldTimeDisplay(state);
+  }
+
+  /**
+   * 根据时辰名称查找对应的分钟偏移（在一天内）
+   */
+  function getShichenMinutes(shichenName) {
+    for (var i = 0; i < SHICHEN.length; i++) {
+      if (SHICHEN[i].name === shichenName || SHICHEN[i].branch === shichenName) return SHICHEN[i].start;
+    }
+    return 0;
+  }
+
+  // ========== 世界切换（穿越/转场）==========
+
+  /**
+   * 应用世界切换，支持穿越到不同世界观
+   * @param {object} state
+   * @param {object} config - { preset, framework, frameworkName, dimensions, customRules, timeEpoch, timeLabel, storyTemplate, tone, reason }
+   */
+  function applyWorldTransition(state, config) {
+    if (!state || !config) return false;
+    config = config || {};
+    var prevWorld = {
+      framework: state.worldLaws ? state.worldLaws.frameworkName : '未知',
+      timeLabel: state.worldTimeLabel || '',
+      template: state.storyType ? state.storyType.template : null
+    };
+
+    // 1. 切换世界法则
+    if (config.preset) {
+      applyWorldLawPreset(state, config.preset);
+    } else {
+      state.worldLaws = state.worldLaws || {};
+      if (config.framework) state.worldLaws.framework = config.framework;
+      if (config.frameworkName) state.worldLaws.frameworkName = config.frameworkName;
+      if (config.dimensions) {
+        var dims = state.worldLaws.dimensions || {};
+        Object.keys(config.dimensions).forEach(function(k) {
+          if (dims[k]) dims[k].value = config.dimensions[k];
+          else dims[k] = { label: k, value: config.dimensions[k], options: [] };
+        });
+        state.worldLaws.dimensions = dims;
+      }
+      if (config.customRules !== undefined) {
+        state.worldLaws.customRules = Array.isArray(config.customRules) ? config.customRules : [];
+      }
+      state.worldLaws.derivedConstraints = [];
+      state.worldLaws.lastModifiedRound = state.round;
+    }
+
+    // 2. 切换时间系统（重置时间起点）
+    if (config.timeEpoch !== undefined) {
+      state.worldTimeEpoch = Math.max(0, config.timeEpoch || 0);
+      state.inWorldMinutes = 0;  // 新世界从 0 开始计时
+      state.timeLogs = [];        // 清空旧世界时间日志
+    }
+    if (config.timeLabel !== undefined) {
+      state.worldTimeLabel = config.timeLabel || '';
+    }
+
+    // 3. 切换故事模板
+    if (config.storyTemplate !== undefined) {
+      state.storyType = state.storyType || {};
+      state.storyType.template = config.storyTemplate || null;
+      state.storyType.currentPhase = 0;
+      state.storyType.phaseProgress = 0;
+    }
+    if (config.tone) {
+      state.storyType = state.storyType || {};
+      state.storyType.tone = config.tone;
+    }
+
+    // 4. 记录穿越日志
+    if (!state.worldTransitionLog) state.worldTransitionLog = [];
+    state.worldTransitionLog.push({
+      round: state.round,
+      from: prevWorld,
+      to: {
+        framework: state.worldLaws ? state.worldLaws.frameworkName : '未知',
+        timeLabel: state.worldTimeLabel || '',
+        template: state.storyType ? state.storyType.template : null
+      },
+      reason: config.reason || '',
+      timestamp: Date.now()
+    });
+    if (state.worldTransitionLog.length > 20) state.worldTransitionLog = state.worldTransitionLog.slice(-20);
+
+    saveState(state);
+    console.log('[World Engine] 🌀 世界切换: ' + prevWorld.framework + ' → ' + (state.worldLaws ? state.worldLaws.frameworkName : '未知'));
+    return true;
+  }
+
   function addTimeLog(state, minutes, source) {
     if (!state.timeLogs) state.timeLogs = [];
     var total = (state.inWorldMinutes || 0) + minutes;
+    var worldTotal = (state.worldTimeEpoch || 0) + total;
+    var info = getWorldTimeInfo(worldTotal);
     state.timeLogs.unshift({
       round: state.round,
       minutes: minutes,
       source: source || 'manual',
       total: total,
+      worldTotal: worldTotal,
+      worldTime: info.dayName + ' ' + info.shichen,
       timestamp: Date.now()
     });
     if (state.timeLogs.length > 50) state.timeLogs.pop();
@@ -1816,7 +1984,10 @@ window.WORLD_ENGINE_CORE = (function() {
     // ★ 记忆冷热
     extractTags, searchMemory, isHotMemory, getMemoryStats, cleanupState,
     // ★ 世界时间
-    addTimeLog, getTimeLogs,
+    addTimeLog, getTimeLogs, getWorldTimeInfo, getWorldTimeDisplay, setWorldTimeEpoch, getShichenMinutes,
+    SHICHEN, DAY_NAMES,
+    // ★ 世界切换
+    applyWorldTransition,
     // ★ NPC 日程
     updateNpcSchedule, getNpcCurrentActivity, getActiveNpcs,
     // ★ 角色画像扩展
